@@ -1,0 +1,91 @@
+Extend my existing yfinance MCP server (keep get_quote, get_historical_data, get_batch_historical_data working and backward compatible). Goal: fewer MCP calls and far fewer tokens for the LLM consuming it. Compute indicators server-side and return small, compact JSON. Do not restructure the project; reuse the existing framework, transport (HTTP /mcp) and yfinance dependency. Use pandas only for indicator math (no new heavy deps unless needed).
+
+## Context and constraints
+- This MCP is a pure market-data server. It has NO connection to any brokerage or trading account and stores no user data. It must never fetch, store, or assume the user's positions, cash, orders, or P&L.
+- If a tool needs position info, the caller passes it as arguments, used only for that single computation. Nothing is persisted, cached or logged.
+- Every tool takes and returns the exact ticker symbol the caller supplies (e.g. AAPL, BTC-USD, ^VIX). Echo the ticker as the key/label in outputs so the LLM can cite it directly. Never rename, alias, or map company names to tickers. Invalid ticker: {"error":"<TICKER>: no data"}.
+- Server-level instruction text: "Market data only. No account, broker, or position access. Use exact ticker symbols. Data may be delayed."
+- No tool name, description or output may imply account access ("my account", "portfolio", "holdings").
+
+## Global output rules (all tools, old and new)
+- Compact JSON: no nulls, no echoed request params, no metadata bloat. Round prices to 2 decimals (4 for forex/crypto under 1), percentages to 2, ratios to 2.
+- Time series as column arrays, not arrays of objects: {"t":["2026-09-25",...],"o":[...],"h":[...],"l":[...],"c":[...],"v":[...]}.
+- Every response includes "as_of" (ISO UTC timestamp of newest data point) and "delayed": true/false when detectable.
+- Errors: one short string, never a stack trace. In batch tools one bad symbol must not fail the call; return it under "errors".
+- In-memory cache: quotes 30s TTL, intraday history 60s, daily history 15min, keyed by (symbol, period, interval). Add "cached": true when served from cache. Cache market data only.
+
+## Upgrade existing tools
+1. get_historical_data and get_batch_historical_data: add optional params
+   - fields: subset of [o,h,l,c,v], default all
+   - limit: return only the last N bars
+   - compact: bool, default true, column-array format (false keeps old format)
+   - summary_only: bool, returns only {open, high, low, close, return_pct, avg_volume, bars}
+   - resample: optional "W" or "M" to aggregate to weekly/monthly bars
+2. get_quote: add optional symbols list (batch) and fields filter. Default fields: price, chg_pct, prev_close, day_high, day_low, volume, market_state.
+
+## New tools
+
+### get_analysis(symbol, period="1y", interval="1d")
+One-call digest, computed server-side:
+- price, chg_pct
+- sma20, sma50, sma200 and price position vs each ("above"/"below"), ema20
+- rsi14
+- macd: {line, signal, hist, state: "bull"/"bear"/"cross_up"/"cross_down"}
+- atr14, atr_pct
+- high_52w, low_52w, dist_from_high_pct, dist_from_low_pct
+- vol_ratio (last volume / 20-bar avg)
+- support and resistance: nearest 2 each, from swing highs/lows over the last 60 bars
+- trend: "up"/"down"/"range" (price vs SMA50 and SMA200 plus SMA50 slope)
+- as_of
+
+### get_trade_setup(symbol, style="swing")
+style in intraday|swing|position (map to 15m/5d, 1d/6mo, 1wk/2y). Deterministic rules, no ML. Return:
+- bias: "long"/"short"/"none"
+- entry, stop, target, rr (stop = nearest support/resistance +/- 0.5*ATR; target = next opposing level or 2R, whichever is nearer)
+- invalidation: price level where the setup is void
+- score 0-100 and "reasons": max 4 short strings (e.g. "above 50/200 SMA","RSI 61","vol 1.4x")
+- no edge: bias "none", score under 40, reasons explain why
+- as_of
+This assumes a fresh entry only; it knows nothing about existing positions.
+
+### scan_watchlist(symbols[], fields[], sort_by=None, desc=True, limit=None)
+One row per symbol, only requested fields. Allowed: price, chg_pct, rsi14, trend, sma50_pos, sma200_pos, atr_pct, vol_ratio, dist_high_pct, dist_low_pct, ret_5d, ret_1m, ret_3m, ret_ytd, score. Output {"cols":[...],"rows":[[...],...]} sorted by sort_by. Use a single yfinance batch download, not a per-symbol loop. Symbols are supplied by the caller in the call; the server stores no watchlist.
+
+### market_snapshot()
+One call: SPY, QQQ, IWM, ^VIX, DX-Y.NYB, ^TNX, BTC-USD, GC=F, CL=F plus the 11 sector ETFs (XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLB, XLU, XLRE, XLC). Return price, chg_pct, ret_5d, trend per item, sectors ranked by 1d chg_pct, and "regime": "risk_on"/"risk_off"/"neutral" (rule: SPY trend + VIX level/change).
+
+### compare(symbols[], period="6mo", benchmark="SPY")
+Per symbol: return_pct, beta vs benchmark, correlation vs benchmark, max_drawdown_pct, volatility_ann_pct; plus a correlation matrix between the symbols. Compact table.
+
+### get_fundamentals_brief(symbol)
+Key fields only: market_cap, pe, fwd_pe, eps_growth, rev_growth, profit_margin, debt_to_equity, div_yield, analyst_target, analyst_rating, next_earnings_date, sector. Drop nulls.
+
+### get_events(symbols[], days=14)
+Upcoming earnings and ex-dividend dates within the window, per symbol. Empty list when none.
+
+### get_options_brief(symbol)
+Nearest monthly expiry: iv_atm, iv_rank_approx (1y realised-vol percentile if true IV history is unavailable; flag as approx), put_call_oi_ratio, expected_move_pct (iv_atm * sqrt(dte/365)).
+
+### get_news_brief(symbol, n=3)
+Headline, publisher, published time (ISO) only. No bodies, no URLs.
+
+### position_calc(positions[], account_size=None)
+Stateless calculator. positions = [{symbol, qty, avg_cost, stop?}] supplied by the caller. Fetch live prices in one batch call. Return per position: value, pnl, pnl_pct, weight_pct (of supplied positions, or of account_size if given), risk_to_stop_pct and risk_to_stop_amount (if stop given). Totals: value, pnl, top weight, total risk to stops, pairs with correlation > 0.8 over 6mo. Do not persist or log the arguments. Tool description must say: "Stateless. Positions must be supplied by the caller. No account access."
+
+### position_size(symbol, entry=None, stop, risk_amount=None, account_size=None, risk_pct=None)
+Pure math. qty = risk_amount / |entry - stop|, where risk_amount = account_size * risk_pct/100 if not given directly. Return qty (rounded down to whole shares; fractional allowed for symbols ending -USD), position_value, risk_amount. If entry is omitted, use the live price.
+
+## Implementation notes
+- One shared module for indicator math (sma, ema, rsi, macd, atr, swing levels), reused by all tools.
+- Handle yfinance quirks: MultiIndex columns from multi-ticker downloads, empty frames, NaN rows, market-closed data.
+- Keep tool descriptions short and precise about when to use each, so the LLM picks correctly first time. State in get_analysis, scan_watchlist and market_snapshot that they replace multiple calls.
+- No auth, DB, or new endpoints beyond the MCP tools. Do not remove existing tools.
+
+## Acceptance checks (run and show outputs)
+1. get_analysis("AAPL") returns under ~600 chars of JSON.
+2. scan_watchlist(["AAPL","MSFT","NVDA","TSLA"], ["price","chg_pct","rsi14","trend"], sort_by="rsi14") does one yfinance download.
+3. get_historical_data("AAPL","3mo","1d", compact=true, fields=["c"], limit=20) returns a single column array.
+4. An invalid ticker in a batch call returns partial results plus "errors".
+5. A repeated get_quote within 30s reports "cached": true.
+6. position_size("AAPL", entry=230, stop=224, account_size=10000, risk_pct=1) returns qty 16.
+7. Grep confirms no tool name or description mentions account/portfolio/holdings, and positions are never written to disk or logs.

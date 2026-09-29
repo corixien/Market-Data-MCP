@@ -1,1 +1,2 @@
 - [Python publishing runtime](python-publishing-runtime.md) — Python deployments must use the available `python` executable, and package installs need the full Python tools module.
+- [MCP market-data compatibility](mcp-market-data-compatibility.md) — Preserve the existing MCP tools and accept both historical argument orders when extending the server.
