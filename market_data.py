@@ -88,7 +88,11 @@ def validate_limit(limit: int | None) -> int | None:
 def _as_of(frame: pd.DataFrame) -> str | None:
     if frame.empty:
         return None
-    stamp = frame.index[-1]
+    return _timestamp_iso(frame.index[-1])
+
+
+def _timestamp_iso(value: Any) -> str:
+    stamp = value
     if not isinstance(stamp, pd.Timestamp):
         stamp = pd.Timestamp(stamp)
     if stamp.tzinfo is None:
@@ -280,7 +284,7 @@ def compact_history(
         )
         return {key: value for key, value in result.items() if value is not None}
 
-    result["t"] = [_as_of(pd.DataFrame(index=[stamp])) for stamp in frame.index]
+    result["t"] = [_timestamp_iso(stamp) for stamp in frame.index]
     for short, column in allowed.items():
         if short in fields:
             digits = 4 if short == "v" else 2

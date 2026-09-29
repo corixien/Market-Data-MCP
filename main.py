@@ -386,7 +386,7 @@ def get_trade_setup(symbol: str, style: str = "swing") -> dict[str, Any]:
         return {"error": f"{symbol}: style must be intraday, swing, or position"}
     period, interval = configs[style]
     result = _safe_call(symbol, lambda: _analysis_for(symbol, period, interval))
-    if "error" in result:
+    if isinstance(result, dict) and "error" in result:
         return result
     frame, analysis, as_of, cached = result
     price = analysis.get("price")
