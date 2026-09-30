@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+import json
 import logging
 import math
 import os
 import threading
 import time
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -45,6 +49,9 @@ from market_data import (
 
 PORT = int(os.environ.get("PORT", "5000"))
 MAX_BATCH_TICKERS = 50
+BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/24hr"
+FINNHUB_API_URL = "https://finnhub.io/api/v1/quote"
+YFINANCE_DELAY_MINUTES = 15
 DEFAULT_QUOTE_FIELDS = [
     "price",
     "chg_pct",
@@ -53,8 +60,80 @@ DEFAULT_QUOTE_FIELDS = [
     "day_low",
     "volume",
     "market_state",
+    "data_source",
+    "delay_minutes",
+    "timestamp",
 ]
 QUOTE_FIELDS = set(DEFAULT_QUOTE_FIELDS)
+CRYPTO_BASE_ASSETS = {
+    "ADA",
+    "AVAX",
+    "BCH",
+    "BNB",
+    "BTC",
+    "DOGE",
+    "DOT",
+    "ETH",
+    "LINK",
+    "LTC",
+    "MATIC",
+    "NEAR",
+    "PEPE",
+    "SHIB",
+    "SOL",
+    "TRX",
+    "UNI",
+    "XLM",
+    "XMR",
+    "XRP",
+}
+DOW_JONES_30 = {
+    "AAPL",
+    "AMGN",
+    "AMZN",
+    "AXP",
+    "BA",
+    "CAT",
+    "CRM",
+    "CSCO",
+    "CVX",
+    "DIS",
+    "GS",
+    "HD",
+    "HON",
+    "IBM",
+    "JNJ",
+    "JPM",
+    "KO",
+    "MCD",
+    "MMM",
+    "MRK",
+    "MSFT",
+    "NKE",
+    "NVDA",
+    "PG",
+    "SHW",
+    "TRV",
+    "UNH",
+    "V",
+    "VZ",
+    "WMT",
+}
+NASDAQ_100 = {
+    "AAPL", "ABNB", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AXON", "AZN", "BIIB",
+    "BKNG", "BKR", "CCEP", "CDNS", "CEG", "CHTR", "CMCSA", "COST", "CPRT",
+    "CRWD", "CSCO", "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DXCM",
+    "EA", "EXC", "FANG", "FAST", "FER", "FI", "FOX", "FOXA", "GDDY",
+    "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX", "ILMN", "INTC", "INTU",
+    "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "MAR", "MCHP", "MDLZ",
+    "MELI", "META", "MNST", "MRVL", "MSFT", "MU", "NFLX", "NDAQ", "NICE",
+    "NTES", "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR",
+    "PDD", "PEP", "PLTR", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX",
+    "SNPS", "TEAM", "TMUS", "TRI", "TSLA", "TTD", "TTWO", "TXN", "VRSK",
+    "VRTX", "WBD", "WDAY", "WDC", "XEL", "ZS",
+}
+FINNHUB_SYMBOLS = DOW_JONES_30 | NASDAQ_100
 SCAN_FIELDS = {
     "price",
     "chg_pct",
@@ -80,11 +159,16 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 mcp = MCPServer(
     name="yfinance-market-data",
-    title="yfinance Market Data",
-    description="Compact, read-only market data and analysis using exact yfinance ticker symbols.",
+    title="Multi-source Market Data",
+    description=(
+        "Compact, read-only market data with Binance crypto quotes, Finnhub US-stock quotes, "
+        "and yfinance fallback."
+    ),
     instructions=(
-        "Market data only. No account, broker, or position access. "
-        "Use exact ticker symbols. Data may be delayed."
+        "Market data only. No account, broker, or position access. Use exact ticker symbols. "
+        "get_price prioritizes Binance for recognized crypto symbols, Finnhub for Dow Jones 30 "
+        "and Nasdaq 100 symbols, and yfinance-mcp for everything else or as fallback. "
+        "Binance and Finnhub quotes are marked live; yfinance quotes may be delayed."
     ),
     version="2.0.0",
 )
@@ -146,7 +230,134 @@ def _old_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
-def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
+def _http_json(
+    url: str,
+    params: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request = UrlRequest(
+        f"{url}?{urlencode(params)}",
+        headers={"Accept": "application/json", **(headers or {})},
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise RuntimeError(f"provider HTTP {error.code}") from error
+    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise RuntimeError("provider request failed") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("provider returned an invalid response")
+    return payload
+
+
+def _timestamp_from_epoch(value: Any, milliseconds: bool = False) -> str:
+    seconds = float(value) / (1000 if milliseconds else 1)
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+
+
+def _binance_pair(symbol: str) -> str | None:
+    upper = symbol.upper().strip()
+    normalized = upper.replace("-", "").replace("/", "").replace("_", "")
+    for base in sorted(CRYPTO_BASE_ASSETS, key=len, reverse=True):
+        if normalized == base or normalized.startswith(f"{base}USD") or normalized.startswith(f"{base}USDT"):
+            return f"{base}USDT"
+        if upper.startswith(f"{base}-") or upper.startswith(f"{base}/"):
+            return f"{base}USDT"
+    return None
+
+
+def _provider_for(symbol: str) -> str:
+    if _binance_pair(symbol):
+        return "binance"
+    if symbol.upper().strip() in FINNHUB_SYMBOLS:
+        return "finnhub"
+    return "yfinance-mcp"
+
+
+def _binance_quote(symbol: str) -> tuple[dict[str, Any], str]:
+    pair = _binance_pair(symbol)
+    if not pair:
+        raise ValueError("not a Binance crypto symbol")
+    api_key = os.environ.get("BINANCE_API_KEY")
+    api_secret = os.environ.get("BINANCE_API_SECRET")
+    headers: dict[str, str] = {}
+    if api_key and api_secret:
+        # The public ticker endpoint does not require a signature, but the
+        # configured key is still sent for account-level rate-limit tracking.
+        headers["X-MBX-APIKEY"] = api_key
+    payload = _http_json(BINANCE_API_URL, {"symbol": pair}, headers)
+    price = payload.get("lastPrice")
+    close_time = payload.get("closeTime")
+    if price is None or close_time is None:
+        raise RuntimeError("Binance returned no price")
+    timestamp = _timestamp_from_epoch(close_time, milliseconds=True)
+    return (
+        drop_nulls(
+            {
+                "ticker": symbol,
+                "price": rounded(price),
+                "chg_pct": rounded(payload.get("priceChangePercent")),
+                "prev_close": rounded(payload.get("prevClosePrice")),
+                "day_high": rounded(payload.get("highPrice")),
+                "day_low": rounded(payload.get("lowPrice")),
+                "volume": rounded(payload.get("volume"), 4),
+                "market_state": "open",
+                "source_interval": "live",
+            }
+        ),
+        timestamp,
+    )
+
+
+def _finnhub_quote(symbol: str) -> tuple[dict[str, Any], str]:
+    api_key = os.environ.get("FINNHUB_API_KEY")
+    if not api_key:
+        raise RuntimeError("Finnhub API key is not configured")
+    payload = _http_json(FINNHUB_API_URL, {"symbol": symbol.upper(), "token": api_key})
+    price = payload.get("c")
+    timestamp_value = payload.get("t")
+    if not price or not timestamp_value:
+        raise RuntimeError("Finnhub returned no price")
+    timestamp = _timestamp_from_epoch(timestamp_value)
+    return (
+        drop_nulls(
+            {
+                "ticker": symbol,
+                "price": rounded(price),
+                "chg_pct": rounded(payload.get("dp")),
+                "prev_close": rounded(payload.get("pc")),
+                "day_high": rounded(payload.get("h")),
+                "day_low": rounded(payload.get("l")),
+                "market_state": "open",
+                "source_interval": "live",
+            }
+        ),
+        timestamp,
+    )
+
+
+def _with_source(
+    base: dict[str, Any],
+    as_of: str | None,
+    source: str,
+    delay_minutes: int,
+) -> tuple[dict[str, Any], str]:
+    timestamp = as_of or now_utc()
+    return (
+        drop_nulls(
+            {
+                **base,
+                "data_source": source,
+                "delay_minutes": delay_minutes,
+                "timestamp": timestamp,
+            }
+        ),
+        timestamp,
+    )
+
+
+def _yfinance_quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
     now = time.monotonic()
     with _quote_cache_lock:
         cached = _quote_cache.get(symbol)
@@ -201,6 +412,71 @@ def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
     return base, as_of, False
 
 
+def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
+    now = time.monotonic()
+    with _quote_cache_lock:
+        cached = _quote_cache.get(f"routed:{symbol}")
+        if cached and cached[0] > now:
+            logger.info(
+                "price source used ticker=%s source=%s cached=true",
+                symbol,
+                cached[1].get("data_source", "yfinance-mcp"),
+            )
+            return cached[1].copy(), cached[2], True
+
+    preferred = _provider_for(symbol)
+    base: dict[str, Any]
+    as_of: str | None
+    if preferred == "binance":
+        try:
+            provider_base, provider_timestamp = _binance_quote(symbol)
+            base, as_of = _with_source(provider_base, provider_timestamp, "binance", 0)
+        except Exception as error:
+            logger.warning(
+                "price source failed ticker=%s source=binance reason=%s",
+                symbol,
+                str(error).splitlines()[0][:160],
+            )
+            base = {}
+            as_of = None
+    elif preferred == "finnhub":
+        try:
+            provider_base, provider_timestamp = _finnhub_quote(symbol)
+            base, as_of = _with_source(provider_base, provider_timestamp, "finnhub", 0)
+        except Exception as error:
+            logger.warning(
+                "price source failed ticker=%s source=finnhub reason=%s",
+                symbol,
+                str(error).splitlines()[0][:160],
+            )
+            base = {}
+            as_of = None
+    else:
+        base = {}
+        as_of = None
+
+    if not base:
+        yfinance_base, yfinance_as_of, _ = _yfinance_quote_base(symbol)
+        base, as_of = _with_source(
+            yfinance_base,
+            yfinance_as_of,
+            "yfinance-mcp",
+            YFINANCE_DELAY_MINUTES,
+        )
+        if preferred != "yfinance-mcp":
+            logger.info(
+                "price source used ticker=%s source=yfinance-mcp fallback_from=%s",
+                symbol,
+                preferred,
+            )
+    else:
+        logger.info("price source used ticker=%s source=%s", symbol, preferred)
+
+    with _quote_cache_lock:
+        _quote_cache[f"routed:{symbol}"] = (now + 30, base.copy(), as_of)
+    return base, as_of, False
+
+
 def _market_state(symbol: str) -> str:
     if symbol.endswith("-USD") or symbol.endswith("=X"):
         return "open"
@@ -239,6 +515,27 @@ def _analysis_for(symbol: str, period: str, interval: str):
 
 
 @mcp.tool()
+def get_price(ticker: str) -> dict[str, Any]:
+    """Get the latest routed price from Binance, Finnhub, or yfinance fallback."""
+    symbol = ticker_name(ticker)
+    result = _safe_call(symbol, lambda: _quote_base(symbol))
+    if isinstance(result, dict) and "error" in result:
+        return result
+    base, as_of, cached = result
+    return _result(
+        {
+            "price": base.get("price"),
+            "ticker": symbol,
+            "data_source": base.get("data_source", "yfinance-mcp"),
+            "delay_minutes": base.get("delay_minutes", YFINANCE_DELAY_MINUTES),
+            "timestamp": base.get("timestamp") or as_of or now_utc(),
+        },
+        as_of,
+        cached,
+    )
+
+
+@mcp.tool()
 def get_quote(
     ticker: str | None = None,
     symbols: list[str] | None = None,
@@ -253,7 +550,7 @@ def get_quote(
     if len(requested) == 1:
         symbol = requested[0]
         result = _safe_call(symbol, lambda: _quote_base(symbol))
-        if "error" in result:
+        if isinstance(result, dict) and "error" in result:
             return result
         base, as_of, cached = result
         return _result({"ticker": symbol, **{field: base.get(field) for field in selected}}, as_of, cached)
@@ -263,7 +560,7 @@ def get_quote(
     newest = None
     for symbol in requested:
         result = _safe_call(symbol, lambda symbol=symbol: _quote_base(symbol))
-        if "error" in result:
+        if isinstance(result, dict) and "error" in result:
             errors[symbol] = result["error"]
         else:
             base, as_of, _ = result
@@ -787,7 +1084,7 @@ def position_size(
 
 
 async def homepage(_: Request) -> PlainTextResponse:
-    return PlainTextResponse("yfinance market-data MCP server. Connect an MCP client to /mcp.\n")
+    return PlainTextResponse("multi-source market-data MCP server. Connect an MCP client to /mcp.\n")
 
 
 async def healthcheck(_: Request) -> JSONResponse:
