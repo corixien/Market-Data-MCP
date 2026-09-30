@@ -135,7 +135,22 @@ NASDAQ_100 = {
     "SNPS", "TEAM", "TMUS", "TRI", "TSLA", "TTD", "TTWO", "TXN", "VRSK",
     "VRTX", "WBD", "WDAY", "WDC", "XEL", "ZS",
 }
-FINNHUB_SYMBOLS = DOW_JONES_30 | NASDAQ_100
+FINNHUB_SYMBOLS = DOW_JONES_30 | NASDAQ_100 | {"DIA", "QQQ", "SPY"}
+FINNHUB_INDEX_PROXIES = {
+    "^GSPC": ("SPY", "S&P 500"),
+    "GSPC": ("SPY", "S&P 500"),
+    "SPX": ("SPY", "S&P 500"),
+    "SP500": ("SPY", "S&P 500"),
+    "S&P500": ("SPY", "S&P 500"),
+    "SNP500": ("SPY", "S&P 500"),
+    "^DJI": ("DIA", "Dow Jones Industrial Average"),
+    "DJI": ("DIA", "Dow Jones Industrial Average"),
+    "DJIA": ("DIA", "Dow Jones Industrial Average"),
+    "DOW": ("DIA", "Dow Jones Industrial Average"),
+    "^IXIC": ("QQQ", "Nasdaq Composite"),
+    "IXIC": ("QQQ", "Nasdaq Composite"),
+    "NASDAQ": ("QQQ", "Nasdaq Composite"),
+}
 SCAN_FIELDS = {
     "price",
     "chg_pct",
@@ -169,8 +184,10 @@ mcp = MCPServer(
     instructions=(
         "Market data only. No account, broker, or position access. Use exact ticker symbols. "
         "get_price prioritizes CoinGecko for recognized crypto symbols, Finnhub for Dow Jones 30 "
-        "and Nasdaq 100 symbols, and yfinance-mcp for everything else or as fallback. "
-        "CoinGecko and Finnhub quotes are marked live; yfinance quotes may be delayed."
+        "and Nasdaq 100 symbols plus common market ETFs and index aliases, and yfinance-mcp "
+        "for everything else or as fallback. CoinGecko and Finnhub quotes are marked live; "
+        "yfinance quotes may be delayed. Finnhub index aliases may return an explicitly marked "
+        "ETF proxy when the exact index requires a subscription."
     ),
     version="2.0.0",
 )
@@ -274,9 +291,14 @@ def _coingecko_id(symbol: str) -> str | None:
 def _provider_for(symbol: str) -> str:
     if _coingecko_id(symbol):
         return "coingecko"
-    if symbol.upper().strip() in FINNHUB_SYMBOLS:
+    if _finnhub_index_proxy(symbol) or symbol.upper().strip() in FINNHUB_SYMBOLS:
         return "finnhub"
     return "yfinance-mcp"
+
+
+def _finnhub_index_proxy(symbol: str) -> tuple[str, str] | None:
+    normalized = symbol.upper().strip().replace(" ", "").replace("_", "").replace("-", "")
+    return FINNHUB_INDEX_PROXIES.get(normalized)
 
 
 def _coingecko_quote(symbol: str) -> tuple[dict[str, Any], str]:
@@ -321,12 +343,23 @@ def _finnhub_quote(symbol: str) -> tuple[dict[str, Any], str]:
     api_key = os.environ.get("FINNHUB_API_KEY")
     if not api_key:
         raise RuntimeError("Finnhub API key is not configured")
-    payload = _http_json(FINNHUB_API_URL, {"symbol": symbol.upper(), "token": api_key})
+    proxy = _finnhub_index_proxy(symbol)
+    source_symbol = proxy[0] if proxy else symbol.upper()
+    payload = _http_json(FINNHUB_API_URL, {"symbol": source_symbol, "token": api_key})
     price = payload.get("c")
     timestamp_value = payload.get("t")
     if not price or not timestamp_value:
         raise RuntimeError("Finnhub returned no price")
     timestamp = _timestamp_from_epoch(timestamp_value)
+    proxy_fields = (
+        {
+            "proxy_symbol": source_symbol,
+            "proxy_for": proxy[1],
+            "price_is_proxy": True,
+        }
+        if proxy
+        else {}
+    )
     return (
         drop_nulls(
             {
@@ -338,6 +371,7 @@ def _finnhub_quote(symbol: str) -> tuple[dict[str, Any], str]:
                 "day_low": rounded(payload.get("l")),
                 "market_state": "open",
                 "source_interval": "live",
+                **proxy_fields,
             }
         ),
         timestamp,
@@ -536,6 +570,11 @@ def get_price(ticker: str) -> dict[str, Any]:
             "data_source": base.get("data_source", "yfinance-mcp"),
             "delay_minutes": base.get("delay_minutes", YFINANCE_DELAY_MINUTES),
             "timestamp": base.get("timestamp") or as_of or now_utc(),
+            **{
+                field: base[field]
+                for field in ("proxy_symbol", "proxy_for", "price_is_proxy")
+                if field in base
+            },
         },
         as_of,
         cached,
