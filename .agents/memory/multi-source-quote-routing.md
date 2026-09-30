@@ -7,4 +7,4 @@ For latest-price requests, use CoinGecko for recognized crypto symbols, Finnhub 
 
 **Why:** The external providers improve freshness for their supported markets without changing yfinance’s broader symbol and historical-data coverage.
 
-**How to apply:** Preserve `data_source`, `delay_minutes`, and `timestamp` on successful price responses, and log the selected or fallback source without logging credentials or request URLs containing tokens.
+**How to apply:** Use CoinGecko’s public simple-price endpoint with the Replit-stored API key header for crypto quotes. Preserve `data_source`, `delay_minutes`, and `timestamp` on successful price responses, and log the selected or fallback source without logging credentials or request URLs containing tokens.
