@@ -49,7 +49,7 @@ from market_data import (
 
 PORT = int(os.environ.get("PORT", "5000"))
 MAX_BATCH_TICKERS = 50
-BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/24hr"
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
 FINNHUB_API_URL = "https://finnhub.io/api/v1/quote"
 YFINANCE_DELAY_MINUTES = 15
 DEFAULT_QUOTE_FIELDS = [
@@ -65,27 +65,29 @@ DEFAULT_QUOTE_FIELDS = [
     "timestamp",
 ]
 QUOTE_FIELDS = set(DEFAULT_QUOTE_FIELDS)
-CRYPTO_BASE_ASSETS = {
-    "ADA",
-    "AVAX",
-    "BCH",
-    "BNB",
-    "BTC",
-    "DOGE",
-    "DOT",
-    "ETH",
-    "LINK",
-    "LTC",
-    "MATIC",
-    "NEAR",
-    "PEPE",
-    "SHIB",
-    "SOL",
-    "TRX",
-    "UNI",
-    "XLM",
-    "XMR",
-    "XRP",
+COINGECKO_CRYPTO_IDS = {
+    "ADA": "cardano",
+    "AVAX": "avalanche-2",
+    "BCH": "bitcoin-cash",
+    "BNB": "binancecoin",
+    "BTC": "bitcoin",
+    "DOGE": "dogecoin",
+    "DOT": "polkadot",
+    "ETH": "ethereum",
+    "LINK": "chainlink",
+    "LTC": "litecoin",
+    "MATIC": "matic-network",
+    "NEAR": "near",
+    "PEPE": "pepe",
+    "SHIB": "shiba-inu",
+    "SOL": "solana",
+    "TRX": "tron",
+    "UNI": "uniswap",
+    "USDC": "usd-coin",
+    "USDT": "tether",
+    "XLM": "stellar",
+    "XMR": "monero",
+    "XRP": "ripple",
 }
 DOW_JONES_30 = {
     "AAPL",
@@ -159,16 +161,16 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 mcp = MCPServer(
     name="yfinance-market-data",
-    title="Multi-source Market Data",
+    title="Live Market Data MCP",
     description=(
-        "Compact, read-only market data with Binance crypto quotes, Finnhub US-stock quotes, "
-        "and yfinance fallback."
+        "A read-only MCP for pulling live market data from CoinGecko and Finnhub, "
+        "with yfinance fallback for broader market coverage."
     ),
     instructions=(
         "Market data only. No account, broker, or position access. Use exact ticker symbols. "
-        "get_price prioritizes Binance for recognized crypto symbols, Finnhub for Dow Jones 30 "
+        "get_price prioritizes CoinGecko for recognized crypto symbols, Finnhub for Dow Jones 30 "
         "and Nasdaq 100 symbols, and yfinance-mcp for everything else or as fallback. "
-        "Binance and Finnhub quotes are marked live; yfinance quotes may be delayed."
+        "CoinGecko and Finnhub quotes are marked live; yfinance quotes may be delayed."
     ),
     version="2.0.0",
 )
@@ -256,52 +258,57 @@ def _timestamp_from_epoch(value: Any, milliseconds: bool = False) -> str:
     return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
 
 
-def _binance_pair(symbol: str) -> str | None:
+def _coingecko_id(symbol: str) -> str | None:
     upper = symbol.upper().strip()
     normalized = upper.replace("-", "").replace("/", "").replace("_", "")
-    for base in sorted(CRYPTO_BASE_ASSETS, key=len, reverse=True):
+    for base, coin_id in sorted(COINGECKO_CRYPTO_IDS.items(), key=lambda item: len(item[0]), reverse=True):
+        if upper == coin_id.upper():
+            return coin_id
         if normalized == base or normalized.startswith(f"{base}USD") or normalized.startswith(f"{base}USDT"):
-            return f"{base}USDT"
+            return coin_id
         if upper.startswith(f"{base}-") or upper.startswith(f"{base}/"):
-            return f"{base}USDT"
+            return coin_id
     return None
 
 
 def _provider_for(symbol: str) -> str:
-    if _binance_pair(symbol):
-        return "binance"
+    if _coingecko_id(symbol):
+        return "coingecko"
     if symbol.upper().strip() in FINNHUB_SYMBOLS:
         return "finnhub"
     return "yfinance-mcp"
 
 
-def _binance_quote(symbol: str) -> tuple[dict[str, Any], str]:
-    pair = _binance_pair(symbol)
-    if not pair:
-        raise ValueError("not a Binance crypto symbol")
-    api_key = os.environ.get("BINANCE_API_KEY")
-    api_secret = os.environ.get("BINANCE_API_SECRET")
-    headers: dict[str, str] = {}
-    if api_key and api_secret:
-        # The public ticker endpoint does not require a signature, but the
-        # configured key is still sent for account-level rate-limit tracking.
-        headers["X-MBX-APIKEY"] = api_key
-    payload = _http_json(BINANCE_API_URL, {"symbol": pair}, headers)
-    price = payload.get("lastPrice")
-    close_time = payload.get("closeTime")
-    if price is None or close_time is None:
-        raise RuntimeError("Binance returned no price")
-    timestamp = _timestamp_from_epoch(close_time, milliseconds=True)
+def _coingecko_quote(symbol: str) -> tuple[dict[str, Any], str]:
+    coin_id = _coingecko_id(symbol)
+    if not coin_id:
+        raise ValueError("not a CoinGecko crypto symbol")
+    api_key = os.environ.get("COINGECKO_API_KEY")
+    headers = {"x-cg-demo-api-key": api_key} if api_key else {}
+    payload = _http_json(
+        COINGECKO_API_URL,
+        {
+            "ids": coin_id,
+            "vs_currencies": "usd",
+            "include_24hr_change": "true",
+            "include_last_updated_at": "true",
+        },
+        headers,
+    )
+    quote = payload.get(coin_id)
+    if not isinstance(quote, dict) or quote.get("usd") is None:
+        raise RuntimeError("CoinGecko returned no price")
+    timestamp = (
+        _timestamp_from_epoch(quote["last_updated_at"])
+        if quote.get("last_updated_at")
+        else now_utc()
+    )
     return (
         drop_nulls(
             {
                 "ticker": symbol,
-                "price": rounded(price),
-                "chg_pct": rounded(payload.get("priceChangePercent")),
-                "prev_close": rounded(payload.get("prevClosePrice")),
-                "day_high": rounded(payload.get("highPrice")),
-                "day_low": rounded(payload.get("lowPrice")),
-                "volume": rounded(payload.get("volume"), 4),
+                "price": rounded(quote.get("usd")),
+                "chg_pct": rounded(quote.get("usd_24h_change")),
                 "market_state": "open",
                 "source_interval": "live",
             }
@@ -427,13 +434,13 @@ def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
     preferred = _provider_for(symbol)
     base: dict[str, Any]
     as_of: str | None
-    if preferred == "binance":
+    if preferred == "coingecko":
         try:
-            provider_base, provider_timestamp = _binance_quote(symbol)
-            base, as_of = _with_source(provider_base, provider_timestamp, "binance", 0)
+            provider_base, provider_timestamp = _coingecko_quote(symbol)
+            base, as_of = _with_source(provider_base, provider_timestamp, "coingecko", 0)
         except Exception as error:
             logger.warning(
-                "price source failed ticker=%s source=binance reason=%s",
+                "price source failed ticker=%s source=coingecko reason=%s",
                 symbol,
                 str(error).splitlines()[0][:160],
             )
@@ -516,7 +523,7 @@ def _analysis_for(symbol: str, period: str, interval: str):
 
 @mcp.tool()
 def get_price(ticker: str) -> dict[str, Any]:
-    """Get the latest routed price from Binance, Finnhub, or yfinance fallback."""
+    """Get the latest routed price from CoinGecko, Finnhub, or yfinance fallback."""
     symbol = ticker_name(ticker)
     result = _safe_call(symbol, lambda: _quote_base(symbol))
     if isinstance(result, dict) and "error" in result:
