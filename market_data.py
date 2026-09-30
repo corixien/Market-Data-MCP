@@ -59,6 +59,19 @@ def rounded(value: Any, digits: int = 2) -> float | int | None:
     return round(float(value), digits)
 
 
+def price_digits(reference: Any) -> int:
+    """Decimals that keep ~4 significant figures: 2 for $336, 4 for EURUSD 1.1712, 9 for SHIB."""
+    value = clean(reference)
+    if not value:
+        return 2
+    return max(2, min(10, 4 - math.floor(math.log10(abs(float(value))))))
+
+
+def px(value: Any, reference: Any = None) -> float | int | None:
+    """Round a price to decimals suited to its magnitude (reference defaults to the value)."""
+    return rounded(value, price_digits(reference if reference is not None else value))
+
+
 def ticker_name(ticker: str) -> str:
     if not isinstance(ticker, str) or not ticker.strip():
         raise NoData("ticker: no data")
@@ -203,12 +216,13 @@ def download_batch(
     interval: str = "1d",
     auto_adjust: bool = False,
     log: bool = True,
+    max_symbols: int = MAX_BATCH_TICKERS,
 ) -> tuple[dict[str, pd.DataFrame], bool, str | None]:
-    symbols = [ticker_name(symbol) for symbol in symbols]
+    symbols = [ticker_name(symbol) for symbol in dict.fromkeys(symbols)]
     if not symbols:
         raise ValueError("symbols must not be empty")
-    if len(symbols) > MAX_BATCH_TICKERS:
-        raise ValueError(f"at most {MAX_BATCH_TICKERS} symbols are supported")
+    if len(symbols) > max_symbols:
+        raise ValueError(f"at most {max_symbols} symbols are supported")
     period = validate_period(period) or "1y"
     interval = validate_interval(interval)
     key = ("batch", tuple(symbols), period, interval, auto_adjust)
@@ -243,6 +257,17 @@ def _resample(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
     )
 
 
+def _time_labels(index: pd.DatetimeIndex) -> tuple[list[str], str | None]:
+    """Short bar labels: date for daily+, exchange-local time for intraday."""
+    intraday = bool((index != index.normalize()).any())
+    if not intraday:
+        return [stamp.strftime("%Y-%m-%d") for stamp in index], None
+    long_span = (index[-1] - index[0]).days > 300
+    fmt = "%Y-%m-%d %H:%M" if long_span else "%m-%d %H:%M"
+    tz = str(index.tz) if getattr(index, "tz", None) is not None else None
+    return [stamp.strftime(fmt) for stamp in index], tz
+
+
 def compact_history(
     frame: pd.DataFrame,
     fields: list[str] | None = None,
@@ -273,10 +298,10 @@ def compact_history(
         avg_volume = frame["Volume"].dropna().mean() if "Volume" in frame else None
         result.update(
             {
-                "open": rounded(frame["Open"].iloc[0]),
-                "high": rounded(frame["High"].max()),
-                "low": rounded(frame["Low"].min()),
-                "close": rounded(last),
+                "open": px(frame["Open"].iloc[0], last),
+                "high": px(frame["High"].max(), last),
+                "low": px(frame["Low"].min(), last),
+                "close": px(last),
                 "return_pct": rounded((last / first - 1) * 100) if first else 0,
                 "avg_volume": rounded(avg_volume, 0) if avg_volume is not None else None,
                 "bars": int(len(frame)),
@@ -284,12 +309,15 @@ def compact_history(
         )
         return {key: value for key, value in result.items() if value is not None}
 
-    result["t"] = [_timestamp_iso(stamp) for stamp in frame.index]
+    labels, tz = _time_labels(frame.index)
+    result["t"] = labels
+    price_dp = price_digits(closes.iloc[-1])
+    if tz:
+        result["tz"] = tz
     for short, column in allowed.items():
         if short in fields:
-            digits = 4 if short == "v" else 2
             result[short] = [
-                rounded(value, digits) if short != "v" else int(value)
+                rounded(value, price_dp) if short != "v" else int(value)
                 for value in frame[column].tolist()
             ]
     return result
@@ -308,104 +336,227 @@ def ema(values: pd.Series, window: int) -> pd.Series:
 
 
 def rsi(values: pd.Series, window: int = 14) -> pd.Series:
+    """Wilder RSI (matches charting platforms)."""
     delta = values.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / window, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / window, adjust=False).mean()
-    return 100 - (100 / (1 + gain / loss.replace(0, float("nan"))))
+    gain = delta.clip(lower=0).ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    result = 100 - (100 / (1 + gain / loss.replace(0, float("nan"))))
+    return result.where(~((loss == 0) & gain.notna()), 100.0)
 
 
 def atr(frame: pd.DataFrame, window: int = 14) -> pd.Series:
+    """Wilder ATR (matches charting platforms)."""
     high, low, close = frame["High"], frame["Low"], frame["Close"]
     previous = close.shift(1)
     true_range = pd.concat(
         [(high - low), (high - previous).abs(), (low - previous).abs()], axis=1
     ).max(axis=1)
-    return true_range.rolling(window).mean()
+    return true_range.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
 
-def indicator_snapshot(frame: pd.DataFrame) -> dict[str, Any]:
+INTRADAY_INTERVALS = frozenset({"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"})
+BARS_PER_YEAR = {"1d": 252, "5d": 52, "1wk": 52, "1mo": 12, "3mo": 4}
+# Cumulative share of a US session's volume normally traded N minutes after the open.
+_US_VOLUME_CURVE = [(0, 0.0), (30, 0.13), (60, 0.22), (120, 0.36), (180, 0.50),
+                    (240, 0.62), (300, 0.75), (360, 0.90), (390, 1.0)]
+
+
+def _partial_day_fraction(frame: pd.DataFrame, interval: str) -> float | None:
+    """Share of the day's volume expected by now when the last daily bar is still forming."""
+    tz = getattr(frame.index, "tz", None)
+    if interval != "1d" or frame.empty or tz is None:
+        return None
+    now = pd.Timestamp.now(tz)
+    if frame.index[-1].date() != now.date():
+        return None
+    name = str(tz)
+    if name in {"UTC", "GMT"}:
+        fraction = (now.hour * 60 + now.minute) / 1440
+    elif name == "America/New_York" and now.weekday() < 5:
+        minutes = now.hour * 60 + now.minute - 570
+        if minutes <= 0 or minutes >= 395:
+            return None
+        fraction = _US_VOLUME_CURVE[-1][1]
+        for (m0, f0), (m1, f1) in zip(_US_VOLUME_CURVE, _US_VOLUME_CURVE[1:]):
+            if m0 <= minutes <= m1:
+                fraction = f0 + (f1 - f0) * (minutes - m0) / (m1 - m0)
+                break
+    else:
+        return None
+    return fraction if 0.04 <= fraction < 1 else None
+
+
+def swing_levels(
+    frame: pd.DataFrame,
+    atr_value: float | None,
+    ref: float,
+    lookback: int = 120,
+    k: int = 2,
+) -> tuple[list[tuple[float, int]], list[tuple[float, int]]]:
+    """Clustered swing support/resistance around ref: ([(price, touches)] nearest first, same)."""
+    sub = frame.tail(lookback)
+    highs = sub["High"].to_numpy(dtype=float)
+    lows = sub["Low"].to_numpy(dtype=float)
+    n = len(sub)
+    if n < 2 * k + 1:
+        return [], []
+    points: set[tuple[float, int]] = set()
+    for i in range(k, n - k):
+        if highs[i] >= highs[i - k : i + k + 1].max():
+            points.add((float(highs[i]), i))
+        if lows[i] <= lows[i - k : i + k + 1].min():
+            points.add((float(lows[i]), i))
+    points.add((float(highs.max()), int(highs.argmax())))
+    points.add((float(lows.min()), int(lows.argmin())))
+    recent = sub.tail(20)
+    points.add((float(recent["High"].max()), n - 20 + int(recent["High"].to_numpy().argmax())))
+    points.add((float(recent["Low"].min()), n - 20 + int(recent["Low"].to_numpy().argmin())))
+    tolerance = 0.5 * atr_value if atr_value else 0.005 * ref
+    clusters: list[list[float]] = []
+    for price, _ in sorted(points):
+        if clusters and price - (sum(clusters[-1]) / len(clusters[-1])) <= tolerance:
+            clusters[-1].append(price)
+        else:
+            clusters.append([price])
+    levels = [(sum(group) / len(group), len(group)) for group in clusters]
+    supports = sorted((item for item in levels if item[0] < ref), key=lambda item: -item[0])
+    resistances = sorted((item for item in levels if item[0] > ref), key=lambda item: item[0])
+    return supports, resistances
+
+
+def _classify_trend(
+    current: float, s20: pd.Series, s50: pd.Series, s200: pd.Series, short_basis: bool = False
+) -> tuple[str, str | None]:
+    """up/down/range from price vs fast/slow SMA and fast slope; 20/50 when 200 bars are missing
+    or the bars are weekly/monthly (a 200-bar weekly SMA is a four-year filter)."""
+    fast, slow, basis = s50.dropna(), s200.dropna(), None
+    if slow.empty or short_basis:
+        fast, slow, basis = s20.dropna(), s50.dropna(), "20/50"
+    if fast.empty or slow.empty or len(fast) < 11:
+        return "range", basis
+    slope = float(fast.iloc[-1] - fast.iloc[-11])
+    if current > fast.iloc[-1] > slow.iloc[-1] and slope > 0:
+        return "up", basis
+    if current < fast.iloc[-1] < slow.iloc[-1] and slope < 0:
+        return "down", basis
+    return "range", basis
+
+
+def _vwap(frame: pd.DataFrame) -> float | None:
+    if not bool((frame.index != frame.index.normalize()).any()):
+        return None
+    day = frame[frame.index.date == frame.index[-1].date()]
+    volume = pd.to_numeric(day["Volume"], errors="coerce").fillna(0)
+    if volume.sum() <= 0:
+        return None
+    typical = (day["High"] + day["Low"] + day["Close"]) / 3
+    return float((typical * volume).sum() / volume.sum())
+
+
+def indicator_snapshot(frame: pd.DataFrame, interval: str = "1d") -> dict[str, Any]:
+    frame = frame.dropna(subset=["High", "Low", "Close"])
     close = series(frame)
-    high, low = series(frame, "High"), series(frame, "Low")
-    volume = series(frame, "Volume")
     current = float(close.iloc[-1])
+    volume = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
     sma20, sma50, sma200 = sma(close, 20), sma(close, 50), sma(close, 200)
     ema20 = ema(close, 20)
-    rsi14 = rsi(close)
+    rsi14 = rsi(close).dropna()
     macd_line = ema(close, 12) - ema(close, 26)
     macd_signal = ema(macd_line, 9)
     macd_hist = macd_line - macd_signal
     atr14 = atr(frame).dropna()
-    high_52 = high.tail(252).max()
-    low_52 = low.tail(252).min()
-    sma50_last = sma50.dropna().iloc[-1] if not sma50.dropna().empty else None
-    sma200_last = sma200.dropna().iloc[-1] if not sma200.dropna().empty else None
-    slope = 0
-    if len(sma50.dropna()) >= 10:
-        slope = float(sma50.dropna().iloc[-1] - sma50.dropna().iloc[-10])
-    trend = "range"
-    if sma50_last is not None and sma200_last is not None:
-        if current > sma50_last > sma200_last and slope > 0:
-            trend = "up"
-        elif current < sma50_last < sma200_last and slope < 0:
-            trend = "down"
+    atr_value = float(atr14.iloc[-1]) if not atr14.empty else None
+    sma20_last = float(sma20.dropna().iloc[-1]) if not sma20.dropna().empty else None
+    sma50_last = float(sma50.dropna().iloc[-1]) if not sma50.dropna().empty else None
+    sma200_last = float(sma200.dropna().iloc[-1]) if not sma200.dropna().empty else None
+    trend, basis = _classify_trend(current, sma20, sma50, sma200, interval in {"1wk", "1mo", "3mo", "5d"})
 
-    swings = frame.tail(60)
-    supports = [
-        float(swings["Low"].iloc[i])
-        for i in range(2, len(swings) - 2)
-        if swings["Low"].iloc[i] < swings["Low"].iloc[i - 1]
-        and swings["Low"].iloc[i] < swings["Low"].iloc[i + 1]
-        and swings["Low"].iloc[i] < current
-    ]
-    resistances = [
-        float(swings["High"].iloc[i])
-        for i in range(2, len(swings) - 2)
-        if swings["High"].iloc[i] > swings["High"].iloc[i - 1]
-        and swings["High"].iloc[i] > swings["High"].iloc[i + 1]
-        and swings["High"].iloc[i] > current
-    ]
-    supports = sorted(set(supports), reverse=True)[:2]
-    resistances = sorted(set(resistances))[:2]
+    per_year = BARS_PER_YEAR.get(interval)
+    high_52 = low_52 = None
+    if per_year and len(frame) >= per_year * 0.95:
+        high_52 = float(frame["High"].tail(per_year).max())
+        low_52 = float(frame["Low"].tail(per_year).min())
+
+    supports, resistances = swing_levels(frame, atr_value, current)
     macd_state = "bull" if float(macd_line.iloc[-1]) >= float(macd_signal.iloc[-1]) else "bear"
-    if len(macd_line.dropna()) >= 2 and len(macd_signal.dropna()) >= 2:
+    if len(macd_line) >= 2:
         previous_gap = macd_line.iloc[-2] - macd_signal.iloc[-2]
         current_gap = macd_line.iloc[-1] - macd_signal.iloc[-1]
         if previous_gap <= 0 < current_gap:
             macd_state = "cross_up"
         elif previous_gap >= 0 > current_gap:
             macd_state = "cross_down"
-    avg_volume = volume.tail(20).mean() if not volume.empty else None
-    last_volume = float(volume.iloc[-1]) if not volume.empty else None
-    atr_value = float(atr14.iloc[-1]) if not atr14.empty else None
-    rsi_value = rsi14.dropna().iloc[-1] if not rsi14.dropna().empty else None
+
+    vol_ratio, vol_projected = None, False
+    if len(volume) > 22 and interval not in INTRADAY_INTERVALS:
+        fraction = _partial_day_fraction(frame, interval)
+        # weekly/monthly: the last bar is still forming, use the last completed one
+        offset = 2 if interval in {"1wk", "1mo", "3mo", "5d"} else 1
+        last_volume = float(volume.iloc[-offset])
+        baseline = float(volume.iloc[-offset - 20 : -offset].mean())
+        if baseline > 0:
+            if fraction and offset == 1:
+                last_volume, vol_projected = last_volume / fraction, True
+            vol_ratio = last_volume / baseline
+
+    def ret(bars: int) -> float | None:
+        if interval != "1d" or len(close) <= bars:
+            return None
+        return (current / float(close.iloc[-1 - bars]) - 1) * 100
+
+    dp = price_digits(current)
     result = {
-        "price": rounded(current),
+        "price": rounded(current, dp),
         "chg_pct": rounded((current / float(close.iloc[-2]) - 1) * 100) if len(close) > 1 else 0,
-        "sma20": rounded(sma20.dropna().iloc[-1]) if not sma20.dropna().empty else None,
-        "sma50": rounded(sma50_last),
-        "sma200": rounded(sma200_last),
-        "sma50_pos": "above" if sma50_last and current >= sma50_last else "below",
-        "sma200_pos": "above" if sma200_last and current >= sma200_last else "below",
-        "ema20": rounded(ema20.iloc[-1]),
-        "rsi14": rounded(rsi_value),
+        "sma20": rounded(sma20_last, dp),
+        "sma50": rounded(sma50_last, dp),
+        "sma200": rounded(sma200_last, dp),
+        "sma50_pos": None if sma50_last is None else "above" if current >= sma50_last else "below",
+        "sma200_pos": None if sma200_last is None else "above" if current >= sma200_last else "below",
+        "ema20": rounded(ema20.iloc[-1], dp),
+        "rsi14": rounded(rsi14.iloc[-1]) if not rsi14.empty else None,
         "macd": {
-            "line": rounded(macd_line.iloc[-1]),
-            "signal": rounded(macd_signal.iloc[-1]),
-            "hist": rounded(macd_hist.iloc[-1]),
+            "line": rounded(macd_line.iloc[-1], dp + 1),
+            "signal": rounded(macd_signal.iloc[-1], dp + 1),
+            "hist": rounded(macd_hist.iloc[-1], dp + 1),
             "state": macd_state,
         },
-        "atr14": rounded(atr_value),
+        "atr14": rounded(atr_value, dp + 1),
         "atr_pct": rounded(atr_value / current * 100) if atr_value and current else None,
-        "high_52w": rounded(high_52),
-        "low_52w": rounded(low_52),
-        "dist_high_pct": rounded((current / float(high_52) - 1) * 100) if high_52 else None,
-        "dist_low_pct": rounded((current / float(low_52) - 1) * 100) if low_52 else None,
-        "vol_ratio": rounded(last_volume / avg_volume) if avg_volume else None,
-        "support": [rounded(value) for value in supports],
-        "resistance": [rounded(value) for value in resistances],
+        "ext_atr": rounded((current - float(ema20.iloc[-1])) / atr_value) if atr_value else None,
+        "high_52w": rounded(high_52, dp),
+        "low_52w": rounded(low_52, dp),
+        "dist_high_pct": rounded((current / high_52 - 1) * 100) if high_52 else None,
+        "dist_low_pct": rounded((current / low_52 - 1) * 100) if low_52 else None,
+        "ret_5d": rounded(ret(5)),
+        "ret_1m": rounded(ret(21)),
+        "ret_3m": rounded(ret(63)),
+        "vol_ratio": rounded(vol_ratio),
+        "vol_proj": True if vol_projected else None,
+        "vwap": rounded(_vwap(frame), dp),
+        "support": [rounded(p, dp) for p, _ in supports if atr_value is None or current - p >= 0.2 * atr_value][:2],
+        "resistance": [rounded(p, dp) for p, _ in resistances if atr_value is None or p - current >= 0.2 * atr_value][:2],
         "trend": trend,
+        "trend_basis": basis,
     }
     return drop_nulls(result)
+
+
+def bull_score(a: dict[str, Any], rs: float | None = None) -> int:
+    """Deterministic 0-100 bullishness (50 neutral): trend, MAs, MACD, RSI, relative strength."""
+    score = 50.0
+    score += {"up": 16, "down": -16}.get(a.get("trend"), 0)
+    score += {"above": 6, "below": -6}.get(a.get("sma50_pos"), 0)
+    score += {"above": 4, "below": -4}.get(a.get("sma200_pos"), 0)
+    score += {"bull": 5, "cross_up": 5, "bear": -5, "cross_down": -5}.get(a.get("macd", {}).get("state"), 0)
+    rsi_value = a.get("rsi14")
+    if rsi_value is not None:
+        score += max(-5.0, min(4.0, (rsi_value - 50) / 4)) - (3 if rsi_value >= 75 else 0)
+    if rs is not None:
+        score += max(-7.0, min(7.0, rs / 3))
+    if (a.get("ext_atr") or 0) > 2.5:
+        score -= 4
+    return int(max(0, min(100, round(score))))
 
 
 def drop_nulls(value: Any) -> Any:

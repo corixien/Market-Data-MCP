@@ -2,3 +2,4 @@
 - [MCP market-data compatibility](mcp-market-data-compatibility.md) — Preserve the existing MCP tools and accept both historical argument orders when extending the server.
 - [Yahoo intraday retention](yahoo-intraday-retention.md) — Yahoo supports sub-hour bars, but retention depends on interval; 1m history is limited to roughly one week.
 - [Multi-source quote routing](multi-source-quote-routing.md) — Route live crypto and selected US equities through provider APIs, but keep yfinance as the explicit fallback.
+- [Compact output and setup tuning](compact-output-and-setup-tuning.md) — Tools return compact JSON text; setup params come from a backtest, score is not a probability, shorts opt-in.
