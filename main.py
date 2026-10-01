@@ -1134,8 +1134,9 @@ def scan_watchlist(
     limit: int | None = None,
     universe: str | None = None,
     where: list[str] | None = None,
+    skip_downtrend: bool = False,
 ) -> dict[str, Any]:
-    """Rank/screen many tickers in ONE call (daily 1y data). symbols[] and/or universe (mag7, mega, dow30, ndx100, sectors, crypto, macro). where[] filters, e.g. ["rsi14<35","trend=up","vol_ratio>1.2"]. sort_by any field (default score desc; score = bullishness 0-100, use desc=false for shorts). Fields: price chg_pct rsi14 trend sma50_pos sma200_pos atr_pct vol_ratio dist_high_pct dist_low_pct ret_5d ret_1m ret_3m ret_ytd rs_3m ext_atr score. Use limit to cap rows."""
+    """Rank/screen many tickers in ONE call (daily 1y data). skip_downtrend=true is the strategy pre-filter: drops trend=down symbols before the where[] filters and lists them in `skipped` (keeps up/range). symbols[] and/or universe (mag7, mega, dow30, ndx100, sectors, crypto, macro). where[] filters, e.g. ["rsi14<35","trend=up","vol_ratio>1.2"]. sort_by any field (default score desc; score = bullishness 0-100, use desc=false for shorts). Fields: price chg_pct rsi14 trend sma50_pos sma200_pos atr_pct vol_ratio dist_high_pct dist_low_pct ret_5d ret_1m ret_3m ret_ytd rs_3m ext_atr score. Use limit to cap rows."""
     requested = list(dict.fromkeys(ticker_name(item) for item in (symbols or [])))
     if universe:
         if universe not in UNIVERSES:
@@ -1163,12 +1164,16 @@ def scan_watchlist(
 
     rows: list[list[Any]] = []
     missing: list[str] = []
+    skipped: list[str] = []
     for symbol in requested:
         frame = frames.get(symbol)
         if frame is None or frame.empty or len(series(frame)) < 30:
             missing.append(symbol)
             continue
         metrics = indicator_snapshot(frame)
+        if skip_downtrend and metrics.get("trend") == "down":
+            skipped.append(symbol)
+            continue
         if bench_ret is not None and metrics.get("ret_3m") is not None:
             metrics["rs_3m"] = rounded(metrics["ret_3m"] - bench_ret)
         metrics["ret_ytd"] = _ret_ytd(frame)
@@ -1187,6 +1192,9 @@ def scan_watchlist(
     if limit:
         rows = rows[:limit]
     output: dict[str, Any] = {"cols": cols, "rows": rows}
+    if skip_downtrend:
+        output["skipped_down"] = skipped
+        output["scanned"] = len(requested) - len(missing)
     if missing:
         output["no_data"] = missing[:10] if not universe else len(missing)
     return _result(output, as_of, cached)
