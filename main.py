@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
 import uvicorn
 
+from alpaca_stream import configured as alpaca_configured, stream as alpaca_stream
 from market_data import (
     INTERVALS,
     PERIODS,
@@ -59,7 +60,11 @@ PORT = int(os.environ.get("PORT", "5000"))
 MAX_BATCH_TICKERS = 50
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
 FINNHUB_API_URL = "https://finnhub.io/api/v1/quote"
+ALPACA_SNAPSHOT_URL = "https://data.alpaca.markets/v2/stocks/{symbol}/snapshot"
 YFINANCE_DELAY_MINUTES = 15
+# Declared delay per provider (minutes). Lowest delay is tried first, ties keep list order.
+PROVIDER_DELAYS = {"coingecko": 0, "finnhub": 0, "alpaca": 0, "yfinance-mcp": YFINANCE_DELAY_MINUTES}
+US_EQUITY_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z])?$")
 DEFAULT_QUOTE_FIELDS = [
     "price",
     "chg_pct",
@@ -208,14 +213,15 @@ mcp = MCPServer(
     name="yfinance-market-data",
     title="Live Market Data MCP",
     description=(
-        "A read-only MCP for pulling live market data from CoinGecko and Finnhub, "
+        "A read-only MCP for pulling live market data from CoinGecko, Finnhub and Alpaca, "
         "with yfinance fallback for broader market coverage."
     ),
     instructions=(
         "Market data only. No account, broker, or position access. Use exact ticker symbols. "
         "Start with market_snapshot (market-wide) or get_analysis (one ticker); use scan_watchlist "
         "to rank many tickers in one call and get_trade_setup for a fresh-entry plan. "
-        "Prices: CoinGecko for recognized crypto, Finnhub for Dow 30/Nasdaq 100 and common ETFs, "
+        "Prices: the provider with the least delay for the ticker is used (CoinGecko for recognized crypto, "
+        "Finnhub for Dow 30/Nasdaq 100 and common ETFs, Alpaca websocket for other US stocks), "
         "yfinance otherwise or as fallback. Each response has as_of and delayed; delayed=false means live."
     ),
     version="2.1.0",
@@ -366,12 +372,20 @@ def _coingecko_id(symbol: str) -> str | None:
     return None
 
 
-def _provider_for(symbol: str) -> str:
+def _available_providers(symbol: str) -> list[str]:
+    """Providers able to quote symbol, least delay first; yfinance is always the last resort."""
+    available = []
     if _coingecko_id(symbol):
-        return "coingecko"
-    if _finnhub_index_proxy(symbol) or symbol.upper().strip() in FINNHUB_SYMBOLS:
-        return "finnhub"
-    return "yfinance-mcp"
+        available.append("coingecko")
+    else:
+        if os.environ.get("FINNHUB_API_KEY") and (
+            _finnhub_index_proxy(symbol) or symbol.upper().strip() in FINNHUB_SYMBOLS
+        ):
+            available.append("finnhub")
+        if alpaca_configured() and US_EQUITY_RE.match(symbol.upper().strip()):
+            available.append("alpaca")
+    available.append("yfinance-mcp")
+    return sorted(available, key=lambda name: PROVIDER_DELAYS[name])
 
 
 def _finnhub_index_proxy(symbol: str) -> tuple[str, str] | None:
@@ -453,6 +467,37 @@ def _finnhub_quote(symbol: str) -> tuple[dict[str, Any], str]:
             }
         ),
         timestamp,
+    )
+
+
+def _alpaca_quote(symbol: str) -> tuple[dict[str, Any], str]:
+    ticker = symbol.upper().strip()
+    price, epoch = alpaca_stream.latest_trade(ticker)
+    prev_close = None
+    try:
+        snapshot = _http_json(
+            ALPACA_SNAPSHOT_URL.format(symbol=ticker),
+            {"feed": "iex"},
+            {
+                "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY", ""),
+                "APCA-API-SECRET-KEY": os.environ.get("ALPACA_API_SECRET", ""),
+            },
+        )
+        prev_close = (snapshot.get("prevDailyBar") or {}).get("c")
+    except Exception:
+        pass
+    return (
+        drop_nulls(
+            {
+                "ticker": symbol,
+                "price": px(price),
+                "chg_pct": rounded((price / prev_close - 1) * 100) if prev_close else None,
+                "prev_close": px(prev_close, price) if prev_close else None,
+                "market_state": _market_state(symbol),
+                "source_interval": "live",
+            }
+        ),
+        _timestamp_from_epoch(epoch),
     )
 
 
@@ -543,53 +588,44 @@ def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
             )
             return cached[1].copy(), cached[2], True
 
-    preferred = _provider_for(symbol)
-    base: dict[str, Any]
-    as_of: str | None
-    if preferred == "coingecko":
+    quoters = {
+        "coingecko": _coingecko_quote,
+        "finnhub": _finnhub_quote,
+        "alpaca": _alpaca_quote,
+    }
+    base: dict[str, Any] = {}
+    as_of: str | None = None
+    failed: list[str] = []
+    for provider in _available_providers(symbol):
+        if provider == "yfinance-mcp":
+            yfinance_base, yfinance_as_of, _ = _yfinance_quote_base(symbol)
+            base, as_of = _with_source(
+                yfinance_base, yfinance_as_of, provider, PROVIDER_DELAYS[provider]
+            )
+            if failed:
+                logger.info(
+                    "price source used ticker=%s source=yfinance-mcp fallback_from=%s",
+                    symbol,
+                    ",".join(failed),
+                )
+            else:
+                logger.info("price source used ticker=%s source=yfinance-mcp", symbol)
+            break
         try:
-            provider_base, provider_timestamp = _coingecko_quote(symbol)
-            base, as_of = _with_source(provider_base, provider_timestamp, "coingecko", 0)
+            provider_base, provider_timestamp = quoters[provider](symbol)
+            base, as_of = _with_source(
+                provider_base, provider_timestamp, provider, PROVIDER_DELAYS[provider]
+            )
+            logger.info("price source used ticker=%s source=%s", symbol, provider)
+            break
         except Exception as error:
+            failed.append(provider)
             logger.warning(
-                "price source failed ticker=%s source=coingecko reason=%s",
+                "price source failed ticker=%s source=%s reason=%s",
                 symbol,
+                provider,
                 str(error).splitlines()[0][:160],
             )
-            base = {}
-            as_of = None
-    elif preferred == "finnhub":
-        try:
-            provider_base, provider_timestamp = _finnhub_quote(symbol)
-            base, as_of = _with_source(provider_base, provider_timestamp, "finnhub", 0)
-        except Exception as error:
-            logger.warning(
-                "price source failed ticker=%s source=finnhub reason=%s",
-                symbol,
-                str(error).splitlines()[0][:160],
-            )
-            base = {}
-            as_of = None
-    else:
-        base = {}
-        as_of = None
-
-    if not base:
-        yfinance_base, yfinance_as_of, _ = _yfinance_quote_base(symbol)
-        base, as_of = _with_source(
-            yfinance_base,
-            yfinance_as_of,
-            "yfinance-mcp",
-            YFINANCE_DELAY_MINUTES,
-        )
-        if preferred != "yfinance-mcp":
-            logger.info(
-                "price source used ticker=%s source=yfinance-mcp fallback_from=%s",
-                symbol,
-                preferred,
-            )
-    else:
-        logger.info("price source used ticker=%s source=%s", symbol, preferred)
 
     with _quote_cache_lock:
         _quote_cache[f"routed:{symbol}"] = (now + 30, base.copy(), as_of)
@@ -698,7 +734,7 @@ def _analysis_for(symbol: str, period: str, interval: str):
 
 @market_tool
 def get_price(ticker: str) -> dict[str, Any]:
-    """Latest price only (routed CoinGecko/Finnhub/yfinance). Use get_quote for day range, volume, batches."""
+    """Latest price only (routed CoinGecko/Finnhub/Alpaca/yfinance). Use get_quote for day range, volume, batches."""
     symbol = ticker_name(ticker)
     result = _safe_call(symbol, lambda: _quote_base(symbol))
     if isinstance(result, dict) and "error" in result:
@@ -1607,7 +1643,7 @@ def position_size(
 
 
 async def homepage(_: Request) -> PlainTextResponse:
-    return PlainTextResponse("multi-source market-data MCP server. Connect an MCP client to /mcp.\n")
+    return PlainTextResponse("Private market data MCP server for claude.\n")
 
 
 async def healthcheck(_: Request) -> JSONResponse:
