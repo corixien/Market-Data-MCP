@@ -195,6 +195,8 @@ SCAN_FIELDS = {
     "rs_3m",
     "ext_atr",
     "score",
+    "bb_pos",
+    "ema_stack",
 }
 SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC"]
 SNAPSHOT_SYMBOLS = ["SPY", "QQQ", "IWM", "^VIX", "DX-Y.NYB", "^TNX", "BTC-USD", "GC=F", "CL=F"]
@@ -1136,7 +1138,7 @@ def scan_watchlist(
     where: list[str] | None = None,
     skip_downtrend: bool = False,
 ) -> dict[str, Any]:
-    """Rank/screen many tickers in ONE call (daily 1y data). skip_downtrend=true is the strategy pre-filter: drops trend=down symbols before the where[] filters and lists them in `skipped` (keeps up/range). symbols[] and/or universe (mag7, mega, dow30, ndx100, sectors, crypto, macro). where[] filters, e.g. ["rsi14<35","trend=up","vol_ratio>1.2"]. sort_by any field (default score desc; score = bullishness 0-100, use desc=false for shorts). Fields: price chg_pct rsi14 trend sma50_pos sma200_pos atr_pct vol_ratio dist_high_pct dist_low_pct ret_5d ret_1m ret_3m ret_ytd rs_3m ext_atr score. Use limit to cap rows."""
+    """Rank/screen many tickers in ONE call (daily 1y data). skip_downtrend=true is the strategy pre-filter: drops trend=down symbols before the where[] filters and lists them in `skipped_down` (keeps up/range). symbols[] and/or universe (mag7, mega, dow30, ndx100, sectors, crypto, macro). where[] filters, e.g. ["rsi14<35","trend=up","vol_ratio>1.2"]. sort_by any field (default score desc; score = bullishness 0-100, use desc=false for shorts). Fields: price chg_pct rsi14 trend sma50_pos sma200_pos atr_pct vol_ratio dist_high_pct dist_low_pct ret_5d ret_1m ret_3m ret_ytd rs_3m ext_atr score bb_pos (Bollinger %B: <0 below lower band) ema_stack (bull = EMA5>13>20>50). Use limit to cap rows."""
     requested = list(dict.fromkeys(ticker_name(item) for item in (symbols or [])))
     if universe:
         if universe not in UNIVERSES:

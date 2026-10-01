@@ -460,6 +460,14 @@ def indicator_snapshot(frame: pd.DataFrame, interval: str = "1d") -> dict[str, A
     volume = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
     sma20, sma50, sma200 = sma(close, 20), sma(close, 50), sma(close, 200)
     ema20 = ema(close, 20)
+    ema5, ema13, ema50, ema200 = ema(close, 5), ema(close, 13), ema(close, 50), ema(close, 200)
+    bb_mid, bb_std = close.rolling(20).mean(), close.rolling(20).std()
+    bb_low, bb_up = bb_mid - 2 * bb_std, bb_mid + 2 * bb_std
+    bb_width = float(bb_up.iloc[-1] - bb_low.iloc[-1]) if len(close) >= 20 else 0
+    ema_stack = None
+    if len(close) >= 50:
+        pile = [float(e.iloc[-1]) for e in (ema5, ema13, ema20, ema50)]
+        ema_stack = "bull" if pile[0] > pile[1] > pile[2] > pile[3] else "bear" if pile[0] < pile[1] < pile[2] < pile[3] else "mixed"
     rsi14 = rsi(close).dropna()
     macd_line = ema(close, 12) - ema(close, 26)
     macd_signal = ema(macd_line, 9)
@@ -514,6 +522,14 @@ def indicator_snapshot(frame: pd.DataFrame, interval: str = "1d") -> dict[str, A
         "sma50_pos": None if sma50_last is None else "above" if current >= sma50_last else "below",
         "sma200_pos": None if sma200_last is None else "above" if current >= sma200_last else "below",
         "ema20": rounded(ema20.iloc[-1], dp),
+        "ema5": rounded(ema5.iloc[-1], dp),
+        "ema13": rounded(ema13.iloc[-1], dp),
+        "ema50": rounded(ema50.iloc[-1], dp) if len(close) >= 50 else None,
+        "ema200": rounded(ema200.iloc[-1], dp) if len(close) >= 200 else None,
+        "ema_stack": ema_stack,
+        "bb_low": rounded(bb_low.iloc[-1], dp) if bb_width else None,
+        "bb_up": rounded(bb_up.iloc[-1], dp) if bb_width else None,
+        "bb_pos": rounded((current - float(bb_low.iloc[-1])) / bb_width) if bb_width else None,
         "rsi14": rounded(rsi14.iloc[-1]) if not rsi14.empty else None,
         "macd": {
             "line": rounded(macd_line.iloc[-1], dp + 1),
