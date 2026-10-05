@@ -76,6 +76,7 @@ DEFAULT_QUOTE_FIELDS = [
     "data_source",
     "delay_minutes",
     "timestamp",
+    "fallback_from",
 ]
 QUOTE_FIELDS = set(DEFAULT_QUOTE_FIELDS)
 COINGECKO_CRYPTO_IDS = {
@@ -506,6 +507,7 @@ def _with_source(
     as_of: str | None,
     source: str,
     delay_minutes: int,
+    failed: list[str] | None = None,
 ) -> tuple[dict[str, Any], str]:
     timestamp = as_of or now_utc()
     return (
@@ -515,6 +517,7 @@ def _with_source(
                 "data_source": source,
                 "delay_minutes": delay_minutes,
                 "timestamp": timestamp,
+                "fallback_from": ",".join(failed) if failed else None,
             }
         ),
         timestamp,

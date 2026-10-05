@@ -23,6 +23,7 @@ logger = logging.getLogger("market-mcp.alpaca")
 STREAM_URL = os.environ.get("ALPACA_STREAM_URL", "wss://stream.data.alpaca.markets/v2/iex")
 FIRST_TRADE_WAIT = 3.0
 MAX_TRADE_AGE_SECONDS = 15 * 60
+MAX_SUBSCRIPTIONS = 30  # Alpaca free plan symbol limit; oldest is dropped beyond it
 
 
 def configured() -> bool:
@@ -36,7 +37,7 @@ class AlpacaStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws: Any = None
         self._ready = threading.Event()
-        self._subs: set[str] = set()
+        self._subs: dict[str, None] = {}  # insertion-ordered; least recently used first
         self._trades: dict[str, tuple[float, float]] = {}  # symbol -> (price, epoch seconds)
         self._waiters: dict[str, threading.Event] = {}
         self._failed = False
@@ -126,11 +127,24 @@ class AlpacaStream:
         with self._lock:
             trade = self._trades.get(symbol)
             new = symbol not in self._subs
+            dropped: list[str] = []
+            self._subs.pop(symbol, None)
+            self._subs[symbol] = None
             if new:
-                self._subs.add(symbol)
                 self._waiters[symbol] = threading.Event()
+                while len(self._subs) > MAX_SUBSCRIPTIONS:
+                    old = next(iter(self._subs))
+                    del self._subs[old]
+                    self._trades.pop(old, None)
+                    self._waiters.pop(old, None)
+                    dropped.append(old)
             waiter = self._waiters.get(symbol)
         if new and self._loop and self._ws:
+            if dropped:
+                asyncio.run_coroutine_threadsafe(
+                    self._ws.send(json.dumps({"action": "unsubscribe", "trades": dropped})),
+                    self._loop,
+                )
             asyncio.run_coroutine_threadsafe(
                 self._ws.send(json.dumps({"action": "subscribe", "trades": [symbol]})),
                 self._loop,
