@@ -603,7 +603,7 @@ def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
         if provider == "yfinance-mcp":
             yfinance_base, yfinance_as_of, _ = _yfinance_quote_base(symbol)
             base, as_of = _with_source(
-                yfinance_base, yfinance_as_of, provider, PROVIDER_DELAYS[provider]
+                yfinance_base, yfinance_as_of, provider, PROVIDER_DELAYS[provider], failed
             )
             if failed:
                 logger.info(
