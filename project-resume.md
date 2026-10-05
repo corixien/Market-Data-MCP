@@ -2,7 +2,7 @@
 
 > Instruction for Claude: read this whole file first. Then read every file under "Must read before any change". Do not modify anything until you have fully understood the project. Keep this file updated as you work (see "Maintenance rules").
 
-Last updated: 2026-10-05 21:45
+Last updated: 2026-10-05 22:30
 
 ## 1. What this project is
 Read-only market-data MCP server (Python 3.12). Exposes trading/analysis tools over Streamable HTTP at `/mcp`. Backed by yfinance, with live quote providers (CoinGecko, Finnhub, Alpaca websocket) and yfinance fallback. Built on Replit, deployed to Cloud Run (`.replit`). Consumed by Claude (the `mbs-agent`/`trading-agent` skills use it as the "yfinance-market-data" MCP server). No account/broker access.
@@ -13,9 +13,10 @@ Read-only market-data MCP server (Python 3.12). Exposes trading/analysis tools o
 3. `.agents/memory/multi-source-quote-routing.md` - provider priority and response fields.
 4. `.agents/memory/mcp-market-data-compatibility.md` - tool names and arg order must stay stable.
 5. `.agents/memory/python-publishing-runtime.md` - deploy/runtime constraints.
-6. `main.py` - server, tool registration, quote routing, setup/scan logic (about 1700 lines).
-7. `market_data.py` - history fetch, cache, indicators.
-8. `alpaca_stream.py` - Alpaca websocket trade stream.
+6. `PROVIDERS.md` - provider table: access, secrets, delay, limits, coverage, Deka/ETC findings.
+7. `main.py` - server, tool registration, quote routing, setup/scan logic (about 1700 lines).
+8. `market_data.py` - history fetch, cache, indicators.
+9. `alpaca_stream.py` - Alpaca websocket trade stream.
 
 ## 3. How to navigate
 - `main.py` - entry point (`uvicorn.run(app)`, port from `PORT`, default 5000). `@market_tool` decorator registers tools (compact JSON text output).
@@ -53,6 +54,15 @@ Run from project root.
 - Yahoo 1m history limited to about 1 week.
 - `.gitignore` covers `.pythonlibs/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`.
 
+## Providers (summary, details in PROVIDERS.md)
+| Provider | Delay | Covers |
+|---|---|---|
+| CoinGecko | ~1 min | crypto |
+| Finnhub | 0 | Dow 30, Nasdaq 100, SPY/QQQ/DIA |
+| Alpaca (IEX websocket) | 0 | other US tickers |
+| yfinance | 1-15 min | all else, all history/indicators |
+Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Active Deka funds: daily NAV only. No free live Xetra source exists.
+
 ## 6. Current state
 - Branch / last commit: `main`, `1baf7c7` "Fix fallback_from not reaching yfinance quote responses".
 - Working tree: clean after committing this file.
@@ -64,18 +74,20 @@ Run from project root.
 - [x] EMA 5/13/50/200, Bollinger, `ema_stack`, `bb_pos` scan field (`17887fd`)
 - [x] Alpaca websocket quotes + least-delay routing (`180a19a`; `alpaca_stream.py`, `main.py`)
 - [x] Alpaca subscription cap 30 (LRU) + `fallback_from` response field (`9aaf3cd`, `1baf7c7`)
+- [x] `PROVIDERS.md` written (limits, access, Deka/ETC research)
 - [x] Provider test: CoinGecko/Finnhub/Alpaca delay 0 or ~1 min, yfinance fallback. Alpaca failed earlier only because Replit Deployment was stale/lacked secrets; fixed by republish.
 
 ### In progress
 - (none)
 
 ### Next steps
-1. Await user task.
+1. Await user go-ahead for an ISIN -> ticker resolver tool (`yf.Search`) for Deka ETFs and the 215 ETCs; needs the ETC ISIN list.
 
 ### Open questions / blockers
 - Alpaca IEX quotes lack day_high/day_low/volume. Decision: leave unfilled (IEX volume is partial, extra yfinance call adds latency).
 
 ## 7. Decisions log
+- 2026-10-05 - no new provider added; ISIN resolver tool proposed, awaiting user go-ahead.
 - 2026-10-05 - project-resume.md created and tracked in git (user decision).
 - 2026-10-05 - Alpaca quotes stay IEX-only, no yfinance field fill-in.
 
