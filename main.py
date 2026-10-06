@@ -22,14 +22,12 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
-from mcp.server import MCPServer
-from mcp_types import CallToolResult, TextContent
-from mcp.server.transport_security import TransportSecuritySettings
-from starlette.applications import Starlette
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
+from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Mount, Route
-import uvicorn
 
 from alpaca_stream import configured as alpaca_configured, stream as alpaca_stream
 from market_data import (
@@ -210,13 +208,8 @@ SNAPSHOT_SYMBOLS = ["SPY", "QQQ", "IWM", "^VIX", "DX-Y.NYB", "^TNX", "BTC-USD", 
 logger = logging.getLogger("market-mcp")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-mcp = MCPServer(
+mcp = FastMCP(
     name="yfinance-market-data",
-    title="Live Market Data MCP",
-    description=(
-        "A read-only MCP for pulling live market data from CoinGecko, Finnhub and Alpaca, "
-        "with yfinance fallback for broader market coverage."
-    ),
     instructions=(
         "Market data only. No account, broker, or position access. Use exact ticker symbols. "
         "Start with market_snapshot (market-wide) or get_analysis (one ticker); use scan_watchlist "
@@ -239,13 +232,13 @@ def market_tool(function):
     def wrapper(*args, **kwargs):
         payload = function(*args, **kwargs)
         failed = isinstance(payload, dict) and list(payload) == ["error"]
-        return CallToolResult(
-            content=[TextContent(type="text", text=json.dumps(payload, separators=(",", ":"), default=str, ensure_ascii=False))],
-            is_error=failed,
-        )
+        text = json.dumps(payload, separators=(",", ":"), default=str, ensure_ascii=False)
+        if failed:
+            raise ToolError(text)
+        return ToolResult(content=[TextContent(type="text", text=text)])
 
-    wrapper.__signature__ = inspect.signature(function).replace(return_annotation=CallToolResult)
-    wrapper.__annotations__ = {**function.__annotations__, "return": CallToolResult}
+    wrapper.__signature__ = inspect.signature(function).replace(return_annotation=ToolResult)
+    wrapper.__annotations__ = {**function.__annotations__, "return": ToolResult}
     mcp.tool()(wrapper)
     return function
 
@@ -1645,35 +1638,16 @@ def position_size(
     return _safe_call(symbol, calculate)
 
 
+@mcp.custom_route("/", methods=["GET"])
 async def homepage(_: Request) -> PlainTextResponse:
     return PlainTextResponse("Private market data MCP server for claude.\n")
 
 
+@mcp.custom_route("/healthz", methods=["GET"])
 async def healthcheck(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "mcp_endpoint": "/mcp"})
 
 
-transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-mcp_http_app = mcp.streamable_http_app(
-    streamable_http_path="/mcp",
-    json_response=True,
-    stateless_http=True,
-    transport_security=transport_security,
-    host="0.0.0.0",
-)
-
-
-@asynccontextmanager
-async def lifespan(_: Starlette):
-    async with mcp.session_manager.run():
-        yield
-
-
-app = Starlette(
-    routes=[Route("/", homepage), Route("/healthz", healthcheck), Mount("/", app=mcp_http_app)],
-    lifespan=lifespan,
-)
-
-
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    # Prefect Horizon imports `mcp` from this file and ignores this block.
+    mcp.run(transport="http", host="0.0.0.0", port=PORT, path="/mcp", stateless_http=True, json_response=True)

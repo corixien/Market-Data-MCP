@@ -1,4 +1,4 @@
 yfinance>=0.2.66,<1
-mcp[cli]>=2.2,<3
+fastmcp>=4,<5
 pandas>=2,<4
 websockets>=13,<16

@@ -2,10 +2,10 @@
 
 > Instruction for Claude: read this whole file first. Then read every file under "Must read before any change". Do not modify anything until you have fully understood the project. Keep this file updated as you work (see "Maintenance rules").
 
-Last updated: 2026-10-05 22:30
+Last updated: 2026-10-06
 
 ## 1. What this project is
-Read-only market-data MCP server (Python 3.12). Exposes trading/analysis tools over Streamable HTTP at `/mcp`. Backed by yfinance, with live quote providers (CoinGecko, Finnhub, Alpaca websocket) and yfinance fallback. Built on Replit, deployed to Cloud Run (`.replit`). Consumed by Claude (the `mbs-agent`/`trading-agent` skills use it as the "yfinance-market-data" MCP server). No account/broker access.
+Read-only market-data MCP server (Python 3.12, FastMCP 4). Exposes trading/analysis tools over Streamable HTTP at `/mcp`. Backed by yfinance, with live quote providers (CoinGecko, Finnhub, Alpaca websocket) and yfinance fallback. Hosted on Prefect Horizon (free, deploys from GitHub `main`, entrypoint `main.py:mcp`, OAuth enforced); previously Replit/Cloud Run (`.replit`, still works via `python main.py`). Consumed by Claude (the `mbs-agent`/`trading-agent` skills use it as the "yfinance-market-data" MCP server). No account/broker access.
 
 ## 2. Must read before any change
 1. `.agents/memory/MEMORY.md` - index of design memories; read each linked file (they record why things are as they are).
@@ -36,14 +36,16 @@ Read-only market-data MCP server (Python 3.12). Exposes trading/analysis tools o
 
 ## 4. Commands
 Run from project root.
-- Install: `pip install -r requirements.txt` (yfinance, mcp[cli] 2.x, pandas, websockets).
+- Install: `pip install -r requirements.txt` (yfinance, fastmcp 4, pandas, websockets).
+- Check Horizon compatibility: `fastmcp inspect main.py:mcp`.
 - Run: `python main.py` (use `python`, not `python3`, for Cloud Run).
 - Health: `curl localhost:5000/healthz`.
 - No tests, linter, or CI in repo.
-- Env vars (set in Replit secrets, never in repo): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_STREAM_URL` (optional), `FINNHUB_API_KEY`, `COINGECKO_API_KEY`, `PORT`.
-- Deploy: Replit publish (Cloud Run); retest public `/mcp` URL after each republish.
+- Env vars (set in the Horizon server settings or Replit secrets, never in repo): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_STREAM_URL` (optional), `FINNHUB_API_KEY`, `COINGECKO_API_KEY`, `PORT`.
+- Deploy: push to `main`; Horizon redeploys automatically. Set the secrets in Horizon, entrypoint `main.py:mcp`. Retest `/mcp` after each deploy.
 
 ## 5. Invariants and gotchas
+- Server object must stay a module-level `FastMCP` named `mcp` in `main.py` (Horizon requirement). Tool errors raise `ToolError` (isError true). Binance is not a provider; `BNB` in `COINGECKO_CRYPTO_IDS` is only a CoinGecko coin id.
 - Keep original tool names and `/mcp` HTTP transport; accept both (interval, period) and legacy (period, interval) order.
 - `_history_args` swaps by span comparison, not set membership ("1d"/"3mo" valid as both).
 - Outputs are compact JSON text, no indent, no structured copy (token savings).
@@ -74,6 +76,7 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - [x] EMA 5/13/50/200, Bollinger, `ema_stack`, `bb_pos` scan field (`17887fd`)
 - [x] Alpaca websocket quotes + least-delay routing (`180a19a`; `alpaca_stream.py`, `main.py`)
 - [x] Alpaca subscription cap 30 (LRU) + `fallback_from` response field (`9aaf3cd`, `1baf7c7`)
+- [x] Migrated MCP layer from `mcp.server.MCPServer` to `FastMCP` for Prefect Horizon (`main.py`, `requirements.txt`)
 - [x] `PROVIDERS.md` written (limits, access, Deka/ETC research)
 - [x] Provider test: CoinGecko/Finnhub/Alpaca delay 0 or ~1 min, yfinance fallback. Alpaca failed earlier only because Replit Deployment was stale/lacked secrets; fixed by republish.
 
@@ -87,6 +90,7 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - Alpaca IEX quotes lack day_high/day_low/volume. Decision: leave unfilled (IEX volume is partial, extra yfinance call adds latency).
 
 ## 7. Decisions log
+- 2026-10-06 - moved hosting to Prefect Horizon; replaced MCPServer with FastMCP (Horizon requires a FastMCP instance).
 - 2026-10-05 - no new provider added; ISIN resolver tool proposed, awaiting user go-ahead.
 - 2026-10-05 - project-resume.md created and tracked in git (user decision).
 - 2026-10-05 - Alpaca quotes stay IEX-only, no yfinance field fill-in.

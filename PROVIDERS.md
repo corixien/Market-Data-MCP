@@ -1,6 +1,6 @@
 # Data providers
 
-Verified live on the deployed server 2026-10-05. Rate limits are the providers' published free-tier numbers (not enforced in code); re-check before relying on them.
+Verified live on the deployed server 2026-10-05 (then on Replit; now hosted on Prefect Horizon, set the same secrets there). Rate limits are the providers' published free-tier numbers (not enforced in code); re-check before relying on them.
 
 ## In use
 
