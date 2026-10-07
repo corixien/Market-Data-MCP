@@ -25,7 +25,7 @@ Read-only market-data MCP server (Python 3.12, FastMCP 4). Exposes trading/analy
 - `attached_assets/` - pasted Replit prompts/logs; reference only.
 - `.agents/memory/` - agent memory notes (tracked in git).
 - Routes: `/` text homepage, `/healthz` health JSON, `/mcp` MCP transport (DNS-rebinding protection intentionally disabled for Replit proxy).
-- Tools in `main.py`: `get_price`, `get_quote`, `get_historical_data`, `get_batch_historical_data`, `get_analysis`, `get_trade_setup`, `scan_watchlist`, `market_snapshot`, `compare`, `get_fundamentals_brief`, `get_events`, `get_options_brief`, `get_news_brief`, `position_calc`, `position_size`, plus news/macro: `get_company_news`, `get_market_news`, `search_news`, `get_top_headlines`, `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar`, `get_filings`, `get_insider_trades`, `get_analyst_view`, `get_central_bank_news`, `get_feed_news`.
+- Tools in `main.py`: `get_price`, `get_quote`, `get_historical_data`, `get_batch_historical_data`, `get_analysis`, `get_trade_setup`, `scan_watchlist`, `market_snapshot`, `compare`, `get_fundamentals_brief`, `get_events`, `get_options_brief`, `get_news_brief`, `position_calc`, `position_size`, plus news/macro: `get_company_news`, `get_market_news`, `search_news`, `get_top_headlines`, `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar`, `get_filings`, `get_insider_trades`, `get_analyst_view`, `get_central_bank_news`, `get_feed_news`, `self_test`.
 - Lookup:
   - Quote provider routing -> `_available_providers`, `_quote_base`, `PROVIDER_DELAYS` (main.py)
   - Trade setup logic/params -> `SETUP_STYLES`, `SETUP_PARAMS`, `_build_setup`
@@ -108,6 +108,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - 2026-10-07 - transient Yahoo empty frames: `get_history` retries (0.4 s, 1 s backoff) and `download_batch` re-requests only missing symbols, caching partial results 30 s instead of full TTL (`market_data.py` `_retry`, `RETRY_DELAYS`). `get_batch_historical_data` sets `partial: true` with `errors`, and returns an error when every ticker fails.
 
 - 2026-10-07 - company news relevance scoring (`_finnhub_company_rows`): headline mention +3, summary +1, multi-ticker and wire-service penalties, market-research spam -3; `get_news_brief` uses ranked Finnhub for US tickers, yfinance for non-US/fallback.
+
+- 2026-10-07 - agent-review round: `_market_state` from exchange clock/calendar (NYSE holidays, pre/post, Xetra/LSE hours; Finnhub no longer hardcodes open); `compare` returns `window`; errors carry `retryable`; stale-while-error cache (6 h, `_cache_stale`); news near-duplicate dedupe; NewsAPI call counter; `position_size` `reason`; `get_events` `window`; new `self_test` tool. Correlations verified correct against independent pandas calc (not a bug). Declined: `fetched_at`/`cache_age_s` on every response (touches all tools, low value).
 
 ## 8. Resume prompt
 Paste this into a new session:

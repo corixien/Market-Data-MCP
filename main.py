@@ -236,9 +236,10 @@ mcp = FastMCP(
         "24 h delayed, 100 calls/day). Macro: get_macro_snapshot first, then get_macro_series, "
         "search_macro_series, get_economic_calendar (FRED). Catalysts: get_filings (SEC 8-K/10-K/10-Q), "
         "get_insider_trades (Form 4), get_analyst_view (consensus, earnings surprises), "
-        "get_central_bank_news (Fed, ECB), get_feed_news (DE/US RSS)."
+        "get_central_bank_news (Fed, ECB), get_feed_news (DE/US RSS). self_test checks the server and provider keys. "
+        "as_of = newest data point time; delayed and market_state describe the source and exchange clock."
     ),
-    version="2.3.0",
+    version="2.4.0",
 )
 
 def market_tool(function):
@@ -251,7 +252,7 @@ def market_tool(function):
     @functools.wraps(function)
     def wrapper(*args, **kwargs):
         payload = function(*args, **kwargs)
-        failed = isinstance(payload, dict) and list(payload) == ["error"]
+        failed = isinstance(payload, dict) and "error" in payload and set(payload) <= {"error", "retryable"}
         text = json.dumps(payload, separators=(",", ":"), default=str, ensure_ascii=False)
         if failed:
             raise ToolError(text)
@@ -271,14 +272,18 @@ def _error(symbol: str, error: Exception | str = "no data") -> dict[str, str]:
     return {"error": f"{symbol}: {str(error) if str(error) != 'no data' else 'no data'}"}
 
 
+_TRANSIENT_RE = re.compile(r"HTTP (429|5\d\d)|request failed|timed? ?out|rate limit|temporar|no data", re.I)
+
+
 def _safe_call(symbol: str, function):
+    """Errors keep one shape: {error, retryable}. retryable=true means a later retry may succeed."""
     try:
         return function()
     except NoData:
-        return _error(symbol)
+        return {**_error(symbol), "retryable": True}
     except Exception as error:
         message = str(error).splitlines()[0][:180] or "no data"
-        return _error(symbol, message)
+        return {**_error(symbol, message), "retryable": bool(_TRANSIENT_RE.search(message))}
 
 
 def _result(
@@ -491,7 +496,7 @@ def _finnhub_quote(symbol: str) -> tuple[dict[str, Any], str]:
                 "prev_close": px(payload.get("pc"), price),
                 "day_high": px(payload.get("h"), price),
                 "day_low": px(payload.get("l"), price),
-                "market_state": "open",
+                "market_state": _market_state(symbol),
                 "source_interval": "live",
                 **proxy_fields,
             }
@@ -664,12 +669,76 @@ def _quote_base(symbol: str) -> tuple[dict[str, Any], str | None, bool]:
     return base, as_of, False
 
 
+def _easter(year: int) -> date:
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    m = (a + 11 * h) // 319
+    r = (2 * e + 2 * i - k - h + m + 32) % 7
+    month, day = divmod(h - m + r + 90, 25)
+    return date(year, month, day + 1)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    first = date(year, month, 1)
+    return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def _nyse_holidays(year: int) -> set[date]:
+    def observed(day: date) -> date:
+        return day - timedelta(days=1) if day.weekday() == 5 else day + timedelta(days=1) if day.weekday() == 6 else day
+
+    last_may = date(year, 5, 31)
+    memorial = last_may - timedelta(days=(last_may.weekday() - 0) % 7)
+    holidays = {
+        observed(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),
+        _nth_weekday(year, 2, 0, 3),
+        _easter(year) - timedelta(days=2),
+        memorial,
+        observed(date(year, 6, 19)),
+        observed(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),
+        _nth_weekday(year, 11, 3, 4),
+        observed(date(year, 12, 25)),
+    }
+    return {day for day in holidays if day.year == year}
+
+
+# suffix -> (timezone, open, close) in local decimal hours
+_EXCHANGE_HOURS = {
+    ".DE": ("Europe/Berlin", 9.0, 17.5),
+    ".F": ("Europe/Berlin", 8.0, 20.0),
+    ".L": ("Europe/London", 8.0, 16.5),
+    ".PA": ("Europe/Paris", 9.0, 17.5),
+    ".AS": ("Europe/Amsterdam", 9.0, 17.5),
+    ".MI": ("Europe/Rome", 9.0, 17.5),
+    ".SW": ("Europe/Zurich", 9.0, 17.5),
+}
+
+
 def _market_state(symbol: str) -> str:
+    """open | pre | post | closed | unknown from exchange clock and calendar, never from the data source."""
+    symbol = symbol.upper()
     if symbol.endswith("-USD") or symbol.endswith("=X"):
         return "open"
     try:
+        for suffix, (zone, start, end) in _EXCHANGE_HOURS.items():
+            if symbol.endswith(suffix):
+                now = datetime.now(ZoneInfo(zone))
+                hour = now.hour + now.minute / 60
+                return "open" if now.weekday() < 5 and start <= hour < end else "closed"
+        if "." in symbol.replace(".A", "").replace(".B", ""):
+            return "unknown"
         now = datetime.now(ZoneInfo("America/New_York"))
-        return "open" if now.weekday() < 5 and 9.5 <= now.hour + now.minute / 60 < 16 else "closed"
+        if now.weekday() >= 5 or now.date() in _nyse_holidays(now.year):
+            return "closed"
+        hour = now.hour + now.minute / 60
+        if 9.5 <= hour < 16:
+            return "open"
+        return "pre" if 4 <= hour < 9.5 else "post" if 16 <= hour < 20 else "closed"
     except Exception:
         return "unknown"
 
@@ -1373,6 +1442,12 @@ def compare(
         valid_symbols.append(symbol)
     output: dict[str, Any] = {
         "benchmark": benchmark,
+        "window": {
+            "from": benchmark_frame.index[0].strftime("%Y-%m-%d"),
+            "to": benchmark_frame.index[-1].strftime("%Y-%m-%d"),
+            "obs": int(len(benchmark_returns.dropna())),
+            "basis": "daily returns, inner-joined on date",
+        },
         "cols": ["symbol", "return_pct", "beta", "correlation", "max_drawdown_pct", "volatility_ann_pct"],
         "rows": rows,
     }
@@ -1441,7 +1516,7 @@ def get_events(symbols: list[str], days: int = 14) -> dict[str, Any]:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(one, names))
-    return _result({"data": dict(zip(names, results))})
+    return _result({"window": f"{today}..{end}", "data": dict(zip(names, results))})
 
 
 def _pick_expiry(expiries: list[str]) -> tuple[str, int]:
@@ -1579,17 +1654,29 @@ def _age_hours(value: Any) -> int | None:
     return None if math.isinf(age) else round(age)
 
 
+NEWS_STOP_WORDS = {"the", "and", "with", "for", "from", "that", "its", "after", "says", "will", "has", "are", "was"}
+
+
 def _news_items(
     rows: list[dict[str, Any]], n: int, summary_chars: int, ranked: bool = False
 ) -> list[dict[str, Any]]:
     """Dedupe by headline, newest first (or in given order when ranked), compact fields. No links or bodies (token savings)."""
-    items, seen = [], set()
+    items, seen, seen_words = [], set(), []
     for row in rows if ranked else sorted(rows, key=lambda item: _age_hours_exact(item["ts"])):
         headline = (row.get("headline") or "").strip()
         key = headline.lower()[:80]
         if not headline or headline == "[Removed]" or key in seen:
             continue
+        words = {
+            word.rstrip("s")
+            for word in re.findall(r"[a-z0-9]{3,}", headline.lower())
+            if word not in NEWS_STOP_WORDS
+        }
+        # near-duplicate: same story reworded by another outlet (word overlap >= 50%)
+        if words and any(len(words & other) / len(words | other) >= 0.5 for other in seen_words):
+            continue
         seen.add(key)
+        seen_words.append(words)
         summary = (row.get("summary") or "").strip()
         if summary == "[Removed]" or summary.lower().startswith(key[:40]):
             summary = ""
@@ -1717,8 +1804,20 @@ def get_market_news(category: str = "general", n: int = 10) -> dict[str, Any]:
     return _safe_call(category, fetch)
 
 
+NEWSAPI_DAILY_QUOTA = 100
+_newsapi_calls: dict[str, int] = {}
+
+
+def _newsapi_used_today() -> int:
+    return _newsapi_calls.get(datetime.now(timezone.utc).date().isoformat(), 0)
+
+
 def _newsapi_get(url: str, params: dict[str, Any]) -> dict[str, Any]:
     key = _require_key("NEWSAPI_API_KEY")
+    day = datetime.now(timezone.utc).date().isoformat()
+    if day not in _newsapi_calls:
+        _newsapi_calls.clear()
+    _newsapi_calls[day] = _newsapi_calls.get(day, 0) + 1
     try:
         return _http_json(url, params, headers={"X-Api-Key": key})
     except RuntimeError as error:
@@ -1777,7 +1876,13 @@ def search_news(
         )
         items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 200)
         return _result(
-            {"query": query, "total": payload.get("totalResults"), "count": len(items), "items": items},
+            {
+                "query": query,
+                "total": payload.get("totalResults"),
+                "count": len(items),
+                "items": items,
+                "newsapi_calls_today": f"{_newsapi_used_today()}/{NEWSAPI_DAILY_QUOTA} (this server only)",
+            },
             delayed=True,
         )
 
@@ -1801,7 +1906,15 @@ def get_top_headlines(category: str = "business", country: str = "us", query: st
             lambda: _newsapi_get(NEWSAPI_HEADLINES_URL, params),
         )
         items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 160)
-        return _result({"category": category, "country": country.lower(), "count": len(items), "items": items}, delayed=True)
+        return _result({
+                "category": category,
+                "country": country.lower(),
+                "count": len(items),
+                "items": items,
+                "newsapi_calls_today": f"{_newsapi_used_today()}/{NEWSAPI_DAILY_QUOTA} (this server only)",
+            },
+            delayed=True,
+        )
 
     return _safe_call(category, fetch)
 
@@ -2465,12 +2578,68 @@ def position_size(
             "capped_by_account": True if capped else None,
             "pct_of_account": rounded(qty * live / account_size * 100) if account_size else None,
         }
+        if qty == 0:
+            output["reason"] = (
+                f"account_size too small for one unit at {px(live)}"
+                if capped
+                else f"stop too wide: risk per unit {rounded(per_unit)} exceeds risk_amount {rounded(amount)}"
+            )
         if target is not None:
             output["rr"] = rounded(abs(float(target) - float(live)) / per_unit)
             output["reward_amount"] = rounded(qty * abs(float(target) - float(live)))
         return _result(output, as_of)
 
     return _safe_call(symbol, calculate)
+
+
+@market_tool
+def self_test() -> dict[str, Any]:
+    """Health check of the server itself: provider keys present, AAPL price consistency (routed provider vs yfinance within 1%), compare() sanity (correlations in [-1,1], finite beta), market_state value, ranked company news non-empty, FRED reachable. Returns ok plus per-check pass/fail with detail. Run when results look odd or after a deploy."""
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, function):
+        try:
+            outcome = function()
+            ok, detail = (outcome if isinstance(outcome, tuple) else (bool(outcome), None))
+        except Exception as error:
+            ok, detail = False, (str(error).splitlines() or ["error"])[0][:140]
+        checks.append(drop_nulls({"check": name, "ok": ok, "detail": detail}))
+
+    keys = {name: bool(os.environ.get(name)) for name in ("FINNHUB_API_KEY", "NEWSAPI_API_KEY", "FRED_API_KEY", "ALPACA_API_KEY", "SEC_USER_AGENT")}
+    check("keys_present", lambda: (all(v for k, v in keys.items() if k != "SEC_USER_AGENT"), keys))
+
+    def price_consistency():
+        routed, _, _ = _quote_base("AAPL")
+        yf_quote, _, _ = _yfinance_quote_base("AAPL")
+        a, b = routed.get("price"), yf_quote.get("price")
+        diff = abs(a - b) / b * 100
+        return diff <= 1.0, f"routed {a} ({routed.get('data_source')}) vs yfinance {b}, diff {diff:.2f}%"
+
+    check("price_consistency_AAPL", price_consistency)
+
+    def compare_sanity():
+        result = compare(["AAPL", "MSFT", "NVDA"], period="3mo")
+        matrix = result["correlation"]["matrix"]
+        flat = [value for row in matrix for value in row]
+        betas = [row[2] for row in result["rows"]]
+        ok = all(-1 <= v <= 1 for v in flat) and all(b is not None and math.isfinite(b) for b in betas)
+        return ok, f"obs {result['window']['obs']}, corr {matrix[0][1:]}"
+
+    check("compare_sanity", compare_sanity)
+    check("market_state_valid", lambda: (_market_state("AAPL") in {"open", "pre", "post", "closed"}, _market_state("AAPL")))
+
+    def news():
+        result = get_company_news("AAPL", days=7, n=3)
+        return bool(result.get("items")), f"{result.get('count', 0)} items"
+
+    check("company_news_AAPL", news)
+
+    def fred():
+        rows = _fred_observations("DGS10", "lin", 1)
+        return bool(rows), rows[0] if rows else None
+
+    check("fred_DGS10", fred)
+    return _result({"ok": all(item["ok"] for item in checks), "checks": checks}, delayed=False)
 
 
 @mcp.custom_route("/", methods=["GET"])

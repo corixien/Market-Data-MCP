@@ -32,6 +32,7 @@ class CacheEntry:
     as_of: str | None
 
 
+STALE_MAX_SECONDS = 6 * 3600
 _cache: dict[tuple[Any, ...], CacheEntry] = {}
 _cache_lock = threading.RLock()
 
@@ -120,16 +121,35 @@ def _cache_read(key: tuple[Any, ...]) -> tuple[Any, str | None] | None:
         item = _cache.get(key)
         if item is None:
             return None
-        if item.expires_at <= time.monotonic():
-            _cache.pop(key, None)
+        expired_for = time.monotonic() - item.expires_at
+        if expired_for >= 0:
+            if expired_for > STALE_MAX_SECONDS:
+                _cache.pop(key, None)
             return None
-        value = item.value.copy(deep=True) if isinstance(item.value, pd.DataFrame) else item.value.copy()
-        return value, item.as_of
+        return _copy_entry(item)
+
+
+def _copy_entry(item: CacheEntry) -> tuple[Any, str | None]:
+    value = item.value.copy(deep=True) if isinstance(item.value, pd.DataFrame) else item.value.copy()
+    return value, item.as_of
+
+
+def _cache_stale(key: tuple[Any, ...]) -> tuple[Any, str | None] | None:
+    """Expired-but-recent entry, served only when the upstream fetch failed (stale-while-error)."""
+    with _cache_lock:
+        item = _cache.get(key)
+        if item is None or time.monotonic() - item.expires_at > STALE_MAX_SECONDS:
+            return None
+        return _copy_entry(item)
 
 
 def _cache_write(key: tuple[Any, ...], value: Any, ttl: int, as_of: str | None) -> None:
     with _cache_lock:
-        _cache[key] = CacheEntry(value, time.monotonic() + ttl, as_of)
+        now = time.monotonic()
+        if len(_cache) > 2000:
+            for stale_key in [k for k, v in _cache.items() if now - v.expires_at > STALE_MAX_SECONDS]:
+                _cache.pop(stale_key, None)
+        _cache[key] = CacheEntry(value, now + ttl, as_of)
 
 
 def _history_ttl(interval: str) -> int:
@@ -204,8 +224,17 @@ def get_history(
         kwargs["start"] = start
     if end:
         kwargs["end"] = end
-    frame = _retry(lambda: _normalize_frame(yf.Ticker(ticker).history(**kwargs)), lambda item: item.empty)
+    try:
+        frame = _retry(lambda: _normalize_frame(yf.Ticker(ticker).history(**kwargs)), lambda item: item.empty)
+    except Exception:
+        stale = _cache_stale(key)
+        if stale:
+            return stale[0], True, stale[1]
+        raise
     if frame.empty:
+        stale = _cache_stale(key)
+        if stale:
+            return stale[0], True, stale[1]
         raise NoData(f"{ticker}: no data")
     as_of = _as_of(frame)
     _cache_write(key, frame, _history_ttl(interval), as_of)
@@ -285,6 +314,9 @@ def download_batch(
             continue
         frames.update({name: item for name, item in extra.items() if not item.empty})
     if all(item.empty for item in frames.values()):
+        stale = _cache_stale(key)
+        if stale:
+            return stale[0], True, stale[1]
         raise NoData(f"{symbols[0]}: no data")
     newest = max((_as_of(item) for item in frames.values() if not item.empty), default=None)
     # A result with symbols still missing is cached briefly so the next call retries instead of
