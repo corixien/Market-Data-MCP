@@ -1516,11 +1516,18 @@ def get_options_brief(symbol: str) -> dict[str, Any]:
 
 @market_tool
 def get_news_brief(symbol: str, n: int = 3) -> dict[str, Any]:
-    """Latest n headlines (max 10) with publisher, time and age in hours. No bodies or links. Use to explain a sharp move or check catalysts."""
+    """Latest n headlines (max 10) with publisher, time and age in hours. No bodies or links. US tickers use relevance-ranked Finnhub news (yfinance fallback and for non-US tickers). Use to explain a sharp move or check catalysts."""
 
     def fetch():
         items = []
         now = datetime.now(timezone.utc)
+        if US_EQUITY_RE.match(ticker_name(symbol)) and os.environ.get("FINNHUB_API_KEY"):
+            try:
+                ranked = get_company_news(symbol, days=7, n=max(1, min(n, 10)))
+            except Exception:
+                ranked = None
+            if isinstance(ranked, dict) and ranked.get("items"):
+                return _result({"symbol": ticker_name(symbol), "items": ranked["items"], "source": "finnhub"})
         for item in yf.Ticker(symbol).news[: max(1, min(n, 10))]:
             content = item.get("content", item)
             published = content.get("pubDate") or content.get("providerPublishTime")
@@ -1543,13 +1550,6 @@ def get_news_brief(symbol: str, n: int = 3) -> dict[str, Any]:
                     }
                 )
             )
-        if not items and os.environ.get("FINNHUB_API_KEY"):
-            # yfinance news is often empty on hosted IPs; fall back to Finnhub company news.
-            fallback = get_company_news(symbol, days=7, n=max(1, min(n, 10)))
-            if isinstance(fallback, dict) and fallback.get("items"):
-                return _result(
-                    {"symbol": ticker_name(symbol), "items": fallback["items"], "source": "finnhub"}
-                )
         return _result({"symbol": ticker_name(symbol), "items": items})
 
     return _safe_call(symbol, fetch)
@@ -1579,10 +1579,12 @@ def _age_hours(value: Any) -> int | None:
     return None if math.isinf(age) else round(age)
 
 
-def _news_items(rows: list[dict[str, Any]], n: int, summary_chars: int) -> list[dict[str, Any]]:
-    """Dedupe by headline, newest first, compact fields. No links or bodies (token savings)."""
+def _news_items(
+    rows: list[dict[str, Any]], n: int, summary_chars: int, ranked: bool = False
+) -> list[dict[str, Any]]:
+    """Dedupe by headline, newest first (or in given order when ranked), compact fields. No links or bodies (token savings)."""
     items, seen = [], set()
-    for row in sorted(rows, key=lambda item: _age_hours_exact(item["ts"])):
+    for row in rows if ranked else sorted(rows, key=lambda item: _age_hours_exact(item["ts"])):
         headline = (row.get("headline") or "").strip()
         key = headline.lower()[:80]
         if not headline or headline == "[Removed]" or key in seen:
@@ -1620,32 +1622,52 @@ def _company_keyword(name: str, key: str) -> str | None:
     return words[0] if words and len(words[0]) >= 3 else None
 
 
+NEWS_WIRE_SOURCES = ("globenewswire", "prnewswire", "pr newswire", "business wire", "businesswire", "accesswire", "newsfile")
+NEWS_SPAM_RE = re.compile(
+    r"market (research|size|report|analysis|forecast)|\bCAGR\b|forecast (to|period)|key players|industry (analysis|report)|"
+    r"\bto reach \$[\d.,]+ ?(billion|million)",
+    re.I,
+)
+
+
 def _finnhub_company_rows(payload: list[Any], name: str, keyword: str | None = None) -> list[dict[str, Any]]:
-    """Finnhub tags many market-wide stories with the queried ticker. Prefer stories whose
-    headline/summary name the company or ticker, then focused tags (<=3 tickers); fall back
-    to all stories if fewer than 3 qualify."""
-    rows = [
-        {
-            "headline": row.get("headline"),
-            "source": row.get("source"),
-            "summary": row.get("summary"),
-            "ts": row.get("datetime"),
-            "tags": [t.strip().upper() for t in str(row.get("related") or "").split(",") if t.strip()],
-        }
-        for row in payload
-        if isinstance(row, dict)
-    ]
+    """Rank Finnhub company stories by relevance, best first (recency breaks ties).
+
+    Finnhub tags many market-wide stories and wire press releases with the queried ticker.
+    Score: company/ticker in headline +3, in summary +1, extra tickers beyond 3 -1 each (max -3),
+    wire-service source -1, market-research spam -3. Keep score >= 1; if fewer than 3 qualify,
+    return everything ranked."""
     pattern = re.compile(rf"\b({re.escape(name)}|{re.escape(keyword)})\b" if keyword else rf"\b{re.escape(name)}\b", re.I)
-    mentioned = [row for row in rows if pattern.search(f"{row['headline'] or ''} {row['summary'] or ''}")]
-    if len(mentioned) >= 3:
-        return mentioned
-    focused = [row for row in rows if name in row["tags"] and len(row["tags"]) <= 3]
-    return focused if len(focused) >= 3 else rows
+    rows = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        headline, summary = row.get("headline") or "", row.get("summary") or ""
+        tags = [t.strip().upper() for t in str(row.get("related") or "").split(",") if t.strip()]
+        source = str(row.get("source") or "").lower()
+        score = (3 if pattern.search(headline) else 0) + (1 if pattern.search(summary) else 0)
+        score -= min(3, max(0, len(tags) - 3))
+        if any(wire in source for wire in NEWS_WIRE_SOURCES):
+            score -= 1
+        if NEWS_SPAM_RE.search(f"{headline} {summary}"):
+            score -= 3
+        rows.append(
+            {
+                "headline": headline,
+                "source": row.get("source"),
+                "summary": summary,
+                "ts": row.get("datetime"),
+                "score": score,
+            }
+        )
+    rows.sort(key=lambda item: (-item["score"], _age_hours_exact(item["ts"])))
+    good = [row for row in rows if row["score"] >= 1]
+    return good if len(good) >= 3 else rows
 
 
 @market_tool
 def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
-    """Finnhub company news for a US/CA ticker: last `days` (max 30), n items (max 20), newest first, with source, age_h and a short summary. Richer and longer-range than get_news_brief. Non-US tickers return no items; use get_news_brief or search_news for those."""
+    """Finnhub company news for a US/CA ticker: last `days` (max 30), n items (max 20), ranked by relevance (company named in headline first; wire-service press releases and market-research spam demoted), with source, age_h and a short summary. Richer and longer-range than get_news_brief. Non-US tickers return no items; use get_news_brief or search_news for those."""
 
     def fetch():
         key = _require_key("FINNHUB_API_KEY")
@@ -1662,7 +1684,7 @@ def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
 
         payload = _aux_cached(("fh-news", name, start), NEWS_CACHE_TTL, load)
         rows = _finnhub_company_rows(payload, name, _company_keyword(name, key))
-        items = _news_items(rows, max(1, min(n, 20)), 200)
+        items = _news_items(rows, max(1, min(n, 20)), 200, ranked=True)
         output: dict[str, Any] = {"symbol": name, "days": (today - start).days, "count": len(items), "items": items}
         if not items:
             output["note"] = "no Finnhub news; non-US tickers: use get_news_brief or search_news"

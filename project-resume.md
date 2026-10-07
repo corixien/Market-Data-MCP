@@ -107,6 +107,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 
 - 2026-10-07 - transient Yahoo empty frames: `get_history` retries (0.4 s, 1 s backoff) and `download_batch` re-requests only missing symbols, caching partial results 30 s instead of full TTL (`market_data.py` `_retry`, `RETRY_DELAYS`). `get_batch_historical_data` sets `partial: true` with `errors`, and returns an error when every ticker fails.
 
+- 2026-10-07 - company news relevance scoring (`_finnhub_company_rows`): headline mention +3, summary +1, multi-ticker and wire-service penalties, market-research spam -3; `get_news_brief` uses ranked Finnhub for US tickers, yfinance for non-US/fallback.
+
 ## 8. Resume prompt
 Paste this into a new session:
 > Read project-resume.md in this project fully. Read every file it lists under "Must read before any change". Then continue from "Current state". Do not change anything before you have understood the project. Keep project-resume.md updated.
