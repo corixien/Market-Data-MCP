@@ -99,6 +99,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 
 - 2026-10-07 - added SEC EDGAR (filings, Form 4), Finnhub analyst view, Fed/ECB and DE/US RSS tools. EDGAR and RSS verified live; GDELT, Alpha Vantage, Marketaux skipped (flaky or too small).
 
+- 2026-10-07 - fixes from live test: FRED `releases/dates` limit capped at 1000 (paginated), Finnhub company news filtered to focused tags (<=3 tickers), `get_news_brief` falls back to Finnhub when yfinance is empty, clear NewsAPI 401/429 errors. NewsAPI 401 in Horizon = invalid `NEWSAPI_API_KEY` value (user action).
+
 ## 8. Resume prompt
 Paste this into a new session:
 > Read project-resume.md in this project fully. Read every file it lists under "Must read before any change". Then continue from "Current state". Do not change anything before you have understood the project. Keep project-resume.md updated.

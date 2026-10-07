@@ -1525,6 +1525,13 @@ def get_news_brief(symbol: str, n: int = 3) -> dict[str, Any]:
                     }
                 )
             )
+        if not items and os.environ.get("FINNHUB_API_KEY"):
+            # yfinance news is often empty on hosted IPs; fall back to Finnhub company news.
+            fallback = get_company_news(symbol, days=7, n=max(1, min(n, 10)))
+            if isinstance(fallback, dict) and fallback.get("items"):
+                return _result(
+                    {"symbol": ticker_name(symbol), "items": fallback["items"], "source": "finnhub"}
+                )
         return _result({"symbol": ticker_name(symbol), "items": items})
 
     return _safe_call(symbol, fetch)
@@ -1581,6 +1588,24 @@ def _news_items(rows: list[dict[str, Any]], n: int, summary_chars: int) -> list[
     return items
 
 
+def _finnhub_company_rows(payload: list[Any], name: str) -> list[dict[str, Any]]:
+    """Finnhub tags broad market stories with many tickers. Keep stories that name the symbol
+    in `related` with at most 3 tickers; fall back to all stories if too few remain."""
+    rows = [
+        {
+            "headline": row.get("headline"),
+            "source": row.get("source"),
+            "summary": row.get("summary"),
+            "ts": row.get("datetime"),
+            "tags": [t.strip().upper() for t in str(row.get("related") or "").split(",") if t.strip()],
+        }
+        for row in payload
+        if isinstance(row, dict)
+    ]
+    focused = [row for row in rows if name in row["tags"] and len(row["tags"]) <= 3]
+    return focused if len(focused) >= 3 else rows
+
+
 @market_tool
 def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
     """Finnhub company news for a US/CA ticker: last `days` (max 30), n items (max 20), newest first, with source, age_h and a short summary. Richer and longer-range than get_news_brief. Non-US tickers return no items; use get_news_brief or search_news for those."""
@@ -1599,11 +1624,7 @@ def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
             )
 
         payload = _aux_cached(("fh-news", name, start), NEWS_CACHE_TTL, load)
-        rows = [
-            {"headline": row.get("headline"), "source": row.get("source"), "summary": row.get("summary"), "ts": row.get("datetime")}
-            for row in payload
-            if isinstance(row, dict)
-        ]
+        rows = _finnhub_company_rows(payload, name)
         items = _news_items(rows, max(1, min(n, 20)), 200)
         output: dict[str, Any] = {"symbol": name, "days": (today - start).days, "count": len(items), "items": items}
         if not items:
@@ -1637,6 +1658,18 @@ def get_market_news(category: str = "general", n: int = 10) -> dict[str, Any]:
     return _safe_call(category, fetch)
 
 
+def _newsapi_get(url: str, params: dict[str, Any]) -> dict[str, Any]:
+    key = _require_key("NEWSAPI_API_KEY")
+    try:
+        return _http_json(url, params, headers={"X-Api-Key": key})
+    except RuntimeError as error:
+        if "401" in str(error):
+            raise RuntimeError("NewsAPI rejected NEWSAPI_API_KEY (HTTP 401): check the key value in the host secrets") from error
+        if "429" in str(error):
+            raise RuntimeError("NewsAPI daily quota exhausted (HTTP 429)") from error
+        raise
+
+
 def _newsapi_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if payload.get("status") != "ok":
         raise RuntimeError(f"NewsAPI {payload.get('code') or 'error'}")
@@ -1666,7 +1699,7 @@ def search_news(
     def fetch():
         if sort not in ("publishedAt", "relevancy", "popularity"):
             raise ValueError("sort must be publishedAt, relevancy or popularity")
-        key = _require_key("NEWSAPI_API_KEY")
+        _require_key("NEWSAPI_API_KEY")
         start = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))).date().isoformat()
         params = {"q": query, "from": start, "sortBy": sort, "language": language, "pageSize": 30}
         if domains:
@@ -1674,7 +1707,7 @@ def search_news(
         payload = _aux_cached(
             ("newsapi-search", tuple(sorted(params.items()))),
             NEWS_CACHE_TTL,
-            lambda: _http_json(NEWSAPI_EVERYTHING_URL, params, headers={"X-Api-Key": key}),
+            lambda: _newsapi_get(NEWSAPI_EVERYTHING_URL, params),
         )
         items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 200)
         return _result(
@@ -1692,14 +1725,14 @@ def get_top_headlines(category: str = "business", country: str = "us", query: st
     def fetch():
         if category not in ("business", "technology", "general", "science", "health", "sports", "entertainment"):
             raise ValueError("invalid category")
-        key = _require_key("NEWSAPI_API_KEY")
+        _require_key("NEWSAPI_API_KEY")
         params: dict[str, Any] = {"category": category, "country": country.lower(), "pageSize": 30}
         if query:
             params["q"] = query
         payload = _aux_cached(
             ("newsapi-top", tuple(sorted(params.items()))),
             NEWS_CACHE_TTL,
-            lambda: _http_json(NEWSAPI_HEADLINES_URL, params, headers={"X-Api-Key": key}),
+            lambda: _newsapi_get(NEWSAPI_HEADLINES_URL, params),
         )
         items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 160)
         return _result({"category": category, "country": country.lower(), "count": len(items), "items": items}, delayed=True)
@@ -1869,21 +1902,27 @@ def get_economic_calendar(days: int = 14, all_releases: bool = False) -> dict[st
     def fetch():
         today = datetime.now(timezone.utc).date()
         end = today + timedelta(days=max(1, min(days, 60)))
-        payload = _aux_cached(
-            ("fred-calendar", today, end),
-            MACRO_CACHE_TTL,
-            lambda: _fred(
-                "releases/dates",
-                {
-                    "realtime_start": today.isoformat(),
-                    "realtime_end": end.isoformat(),
-                    "include_release_dates_with_no_data": "true",
-                    "order_by": "release_date",
-                    "sort_order": "asc",
-                    "limit": 5000,
-                },
-            ),
-        )
+        def load():
+            rows: list[dict[str, Any]] = []
+            for offset in range(0, 5000, 1000):  # FRED caps limit at 1000 per call
+                page = _fred(
+                    "releases/dates",
+                    {
+                        "realtime_start": today.isoformat(),
+                        "realtime_end": end.isoformat(),
+                        "include_release_dates_with_no_data": "true",
+                        "order_by": "release_date",
+                        "sort_order": "asc",
+                        "limit": 1000,
+                        "offset": offset,
+                    },
+                ).get("release_dates") or []
+                rows.extend(page)
+                if len(page) < 1000:
+                    break
+            return {"release_dates": rows}
+
+        payload = _aux_cached(("fred-calendar", today, end), MACRO_CACHE_TTL, load)
         events = []
         for row in payload.get("release_dates") or []:
             name = row.get("release_name") or ""
@@ -1985,7 +2024,10 @@ def get_filings(symbol: str, forms: str = "8-K,10-K,10-Q", days: int = 30, n: in
             )
             if len(items) >= max(1, min(n, 25)):
                 break
-        return _result({"symbol": ticker_name(symbol), "count": len(items), "filings": items}, delayed=False)
+        output: dict[str, Any] = {"symbol": ticker_name(symbol), "count": len(items), "filings": items}
+        if not items:
+            output["note"] = f"none in last {days}d for forms {forms}; widen days (10-K/10-Q are quarterly/annual)"
+        return _result(output, delayed=False)
 
     return _safe_call(symbol, fetch)
 
