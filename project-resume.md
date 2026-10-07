@@ -25,7 +25,7 @@ Read-only market-data MCP server (Python 3.12, FastMCP 4). Exposes trading/analy
 - `attached_assets/` - pasted Replit prompts/logs; reference only.
 - `.agents/memory/` - agent memory notes (tracked in git).
 - Routes: `/` text homepage, `/healthz` health JSON, `/mcp` MCP transport (DNS-rebinding protection intentionally disabled for Replit proxy).
-- Tools in `main.py`: `get_price`, `get_quote`, `get_historical_data`, `get_batch_historical_data`, `get_analysis`, `get_trade_setup`, `scan_watchlist`, `market_snapshot`, `compare`, `get_fundamentals_brief`, `get_events`, `get_options_brief`, `get_news_brief`, `position_calc`, `position_size`, plus news/macro: `get_company_news`, `get_market_news`, `search_news`, `get_top_headlines`, `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar`.
+- Tools in `main.py`: `get_price`, `get_quote`, `get_historical_data`, `get_batch_historical_data`, `get_analysis`, `get_trade_setup`, `scan_watchlist`, `market_snapshot`, `compare`, `get_fundamentals_brief`, `get_events`, `get_options_brief`, `get_news_brief`, `position_calc`, `position_size`, plus news/macro: `get_company_news`, `get_market_news`, `search_news`, `get_top_headlines`, `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar`, `get_filings`, `get_insider_trades`, `get_analyst_view`, `get_central_bank_news`, `get_feed_news`.
 - Lookup:
   - Quote provider routing -> `_available_providers`, `_quote_base`, `PROVIDER_DELAYS` (main.py)
   - Trade setup logic/params -> `SETUP_STYLES`, `SETUP_PARAMS`, `_build_setup`
@@ -41,7 +41,7 @@ Run from project root.
 - Run: `python main.py` (use `python`, not `python3`, for Cloud Run).
 - Health: `curl localhost:5000/healthz`.
 - No tests, linter, or CI in repo.
-- Env vars (set in the Horizon server settings or Replit secrets, never in repo): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_STREAM_URL` (optional), `FINNHUB_API_KEY` (quotes and news), `COINGECKO_API_KEY`, `NEWSAPI_API_KEY`, `FRED_API_KEY`, `PORT`.
+- Env vars (set in the Horizon server settings or Replit secrets, never in repo): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_STREAM_URL` (optional), `FINNHUB_API_KEY` (quotes and news), `COINGECKO_API_KEY`, `NEWSAPI_API_KEY`, `FRED_API_KEY`, `SEC_USER_AGENT` (optional), `PORT`.
 - Deploy: push to `main`; Horizon redeploys automatically. Set the secrets in Horizon, entrypoint `main.py:mcp`. Retest `/mcp` after each deploy.
 
 ## 5. Invariants and gotchas
@@ -96,6 +96,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - 2026-10-05 - Alpaca quotes stay IEX-only, no yfinance field fill-in.
 
 - 2026-10-07 - added news (Finnhub, NewsAPI) and macro (FRED) tools in `main.py`; NewsAPI free plan is 24 h delayed, 100 calls/day, so results are cached 10 min and Finnhub is the fresh source.
+
+- 2026-10-07 - added SEC EDGAR (filings, Form 4), Finnhub analyst view, Fed/ECB and DE/US RSS tools. EDGAR and RSS verified live; GDELT, Alpha Vantage, Marketaux skipped (flaky or too small).
 
 ## 8. Resume prompt
 Paste this into a new session:

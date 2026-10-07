@@ -14,6 +14,9 @@ Verified live on the deployed server 2026-10-05 (then on Replit; now hosted on P
 | Finnhub news | REST `/company-news`, `/news`, `token` param (same key as quotes) | `FINNHUB_API_KEY` | near live | 60 calls/min shared with quotes; US/CA company news | `get_company_news`, `get_market_news` |
 | NewsAPI | REST `newsapi.org/v2/everything`, `/top-headlines`, header `X-Api-Key` | `NEWSAPI_API_KEY` | 24 h on free plan | 100 calls/day, `from` max 30 days back; responses cached 10 min | `search_news`, `get_top_headlines` |
 | FRED | REST `api.stlouisfed.org/fred`, `api_key` param | `FRED_API_KEY` | release schedule | 120 calls/min; responses cached 1 h | `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar` |
+| SEC EDGAR | REST `data.sec.gov/submissions`, `sec.gov/Archives` (Form 4 XML), `sec.gov/include/ticker.txt`; needs a contact `User-Agent` | `SEC_USER_AGENT` (optional, format `Name email@example.com`) | filing time | 10 req/s; no key | `get_filings`, `get_insider_trades`. US filers only |
+| Finnhub analyst | REST `/stock/recommendation`, `/stock/earnings` (same key) | `FINNHUB_API_KEY` | daily | shared 60 calls/min | `get_analyst_view`. Price targets and upgrades are premium, not used |
+| RSS feeds | Fed (`federalreserve.gov/feeds`), ECB (`ecb.europa.eu/rss/press.xml`), Tagesschau, Handelsblatt, MarketWatch, CNBC | none | minutes | none; cached 10 min | `get_central_bank_news`, `get_feed_news` (`RSS_FEEDS` in `main.py`) |
 
 Routing (`_available_providers` in `main.py`): least declared delay first. Crypto -> CoinGecko; else Finnhub (listed symbols) then Alpaca (US tickers); yfinance always last. Failed providers are listed in `fallback_from`. Quotes cache 30 s, so repeated calls cost nothing.
 

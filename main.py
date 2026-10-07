@@ -5,7 +5,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+import email.utils
 import functools
+import html
 import inspect
 import json
 import logging
@@ -14,6 +16,7 @@ import os
 import re
 import threading
 import time
+import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -64,6 +67,11 @@ FINNHUB_MARKET_NEWS_URL = "https://finnhub.io/api/v1/news"
 NEWSAPI_EVERYTHING_URL = "https://newsapi.org/v2/everything"
 NEWSAPI_HEADLINES_URL = "https://newsapi.org/v2/top-headlines"
 FRED_API_URL = "https://api.stlouisfed.org/fred"
+SEC_TICKERS_URL = "https://www.sec.gov/include/ticker.txt"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
+FINNHUB_RECOMMENDATION_URL = "https://finnhub.io/api/v1/stock/recommendation"
+FINNHUB_EARNINGS_URL = "https://finnhub.io/api/v1/stock/earnings"
 NEWS_CACHE_TTL = 600
 MACRO_CACHE_TTL = 3600
 YFINANCE_DELAY_MINUTES = 15
@@ -226,9 +234,11 @@ mcp = FastMCP(
         "yfinance otherwise or as fallback. Each response has as_of and delayed; delayed=false means live. "
         "News: get_company_news / get_market_news (Finnhub, fresh), search_news / get_top_headlines (NewsAPI, "
         "24 h delayed, 100 calls/day). Macro: get_macro_snapshot first, then get_macro_series, "
-        "search_macro_series, get_economic_calendar (FRED)."
+        "search_macro_series, get_economic_calendar (FRED). Catalysts: get_filings (SEC 8-K/10-K/10-Q), "
+        "get_insider_trades (Form 4), get_analyst_view (consensus, earnings surprises), "
+        "get_central_bank_news (Fed, ECB), get_feed_news (DE/US RSS)."
     ),
-    version="2.2.0",
+    version="2.3.0",
 )
 
 def market_tool(function):
@@ -1888,6 +1898,309 @@ def get_economic_calendar(days: int = 14, all_releases: bool = False) -> dict[st
         return _result({"count": len(events), "events": events}, delayed=False)
 
     return _safe_call("calendar", fetch)
+
+
+def _http_text(url: str, headers: dict[str, str] | None = None, max_bytes: int = 3_000_000) -> str:
+    request = UrlRequest(url, headers=headers or {})
+    try:
+        with urlopen(request, timeout=10) as response:
+            return response.read(max_bytes).decode("utf-8", errors="replace")
+    except HTTPError as error:
+        raise RuntimeError(f"provider HTTP {error.code}") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError("provider request failed") from error
+
+
+def _sec_headers() -> dict[str, str]:
+    # SEC rejects anonymous agents; set SEC_USER_AGENT="Name email@example.com" in the host secrets.
+    return {"User-Agent": os.environ.get("SEC_USER_AGENT") or "Market-Data-MCP admin@example.com"}
+
+
+def _sec_cik(symbol: str) -> str:
+    def load():
+        rows = _http_text(SEC_TICKERS_URL, _sec_headers()).splitlines()
+        return dict(row.split("\t", 1) for row in rows if "\t" in row)
+
+    table = _aux_cached(("sec-tickers",), 86400, load)
+    cik = table.get(symbol.lower().replace(".", "-").strip())
+    if not cik:
+        raise ValueError("not in SEC ticker list (US-listed filers only)")
+    return cik.strip()
+
+
+def _sec_recent(cik: str) -> list[dict[str, Any]]:
+    def load():
+        text = _http_text(SEC_SUBMISSIONS_URL.format(cik=cik.zfill(10)), _sec_headers())
+        recent = json.loads(text).get("filings", {}).get("recent", {})
+        keys = list(recent)
+        return [dict(zip(keys, values)) for values in zip(*(recent[key] for key in keys))]
+
+    return _aux_cached(("sec-recent", cik), NEWS_CACHE_TTL, load)
+
+
+SEC_8K_ITEMS = {
+    "1.01": "material agreement",
+    "1.02": "agreement terminated",
+    "1.03": "bankruptcy",
+    "2.01": "acquisition/disposal done",
+    "2.02": "earnings results",
+    "2.03": "new debt",
+    "2.05": "restructuring costs",
+    "2.06": "impairment",
+    "3.01": "delisting notice",
+    "3.02": "unregistered equity sale",
+    "4.01": "auditor change",
+    "4.02": "financials non-reliance",
+    "5.01": "control change",
+    "5.02": "officer/director change",
+    "5.07": "shareholder vote",
+    "7.01": "Reg FD",
+    "8.01": "other events",
+}
+
+
+@market_tool
+def get_filings(symbol: str, forms: str = "8-K,10-K,10-Q", days: int = 30, n: int = 10) -> dict[str, Any]:
+    """SEC EDGAR filings for a US ticker, newest first: form, date, and for 8-K the item meaning (earnings results, officer change, material agreement, bankruptcy, delisting notice ...). Primary-source catalysts, often before headlines. forms: comma list (8-K, 10-K, 10-Q, S-1, SC 13D, 4 ...). days max 365; n max 25. US-listed filers only."""
+
+    def fetch():
+        wanted = {form.strip().upper() for form in forms.split(",") if form.strip()}
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))).date().isoformat()
+        items = []
+        for row in _sec_recent(_sec_cik(symbol)):
+            if row.get("filingDate", "") < cutoff:
+                break
+            form = str(row.get("form", "")).upper()
+            if wanted and form not in wanted:
+                continue
+            codes = [code for code in str(row.get("items") or "").split(",") if code and code != "9.01"]
+            items.append(
+                drop_nulls(
+                    {
+                        "form": form,
+                        "date": row.get("filingDate"),
+                        "items": [f"{code} {SEC_8K_ITEMS.get(code, '')}".strip() for code in codes] or None,
+                    }
+                )
+            )
+            if len(items) >= max(1, min(n, 25)):
+                break
+        return _result({"symbol": ticker_name(symbol), "count": len(items), "filings": items}, delayed=False)
+
+    return _safe_call(symbol, fetch)
+
+
+def _xml_value(node: ET.Element | None, path: str) -> str | None:
+    found = node.find(path) if node is not None else None
+    return found.text.strip() if found is not None and found.text else None
+
+
+def _form4_trades(cik: str, row: dict[str, Any]) -> list[dict[str, Any]]:
+    document = str(row["primaryDocument"]).split("/")[-1]
+    accession = str(row["accessionNumber"]).replace("-", "")
+    url = SEC_ARCHIVE_URL.format(cik=int(cik), accession=accession, document=document)
+    root = ET.fromstring(_aux_cached(("sec-form4", url), 86400, lambda: _http_text(url, _sec_headers())))
+    owner = root.find("reportingOwner")
+    relation = owner.find("reportingOwnerRelationship") if owner is not None else None
+    role = _xml_value(relation, "officerTitle") or (
+        "director" if _xml_value(relation, "isDirector") in ("1", "true")
+        else "10% owner" if _xml_value(relation, "isTenPercentOwner") in ("1", "true") else None
+    )
+    trades = []
+    for txn in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        shares = _xml_value(txn, "transactionAmounts/transactionShares/value")
+        price = _xml_value(txn, "transactionAmounts/transactionPricePerShare/value")
+        try:
+            shares_f, price_f = float(shares or 0), float(price or 0)
+        except ValueError:
+            continue
+        trades.append(
+            drop_nulls(
+                {
+                    "date": _xml_value(txn, "transactionDate/value"),
+                    "who": _xml_value(owner, "reportingOwnerId/rptOwnerName"),
+                    "role": role,
+                    "code": _xml_value(txn, "transactionCoding/transactionCode"),
+                    "shares": int(shares_f),
+                    "price": rounded(price_f) if price_f else None,
+                    "value": int(shares_f * price_f) if price_f else None,
+                }
+            )
+        )
+    return trades
+
+
+@market_tool
+def get_insider_trades(symbol: str, days: int = 90, n: int = 12, open_market_only: bool = True) -> dict[str, Any]:
+    """SEC Form 4 insider transactions for a US ticker from the last `days` (max 365), newest first: date, who, role, code, shares, price, value. Codes: P open-market buy, S open-market sale, A grant, M option exercise, F tax withholding. open_market_only=true keeps P/S only (the real conviction signal; grants and tax sales are noise). n = Form 4 filings to parse (max 20). Summary gives net open-market buy/sell value. Cluster buying by several insiders is the strongest signal."""
+
+    def fetch():
+        cik = _sec_cik(symbol)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))).date().isoformat()
+        filings = []
+        for row in _sec_recent(cik):
+            if row.get("filingDate", "") < cutoff:
+                break
+            if row.get("form") == "4":
+                filings.append(row)
+            if len(filings) >= max(1, min(n, 20)):
+                break
+
+        def parse(row):
+            try:
+                return _form4_trades(cik, row)
+            except Exception:
+                return []
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            trades = [trade for batch in pool.map(parse, filings) for trade in batch]
+        bought = sum(t.get("value", 0) for t in trades if t.get("code") == "P")
+        sold = sum(t.get("value", 0) for t in trades if t.get("code") == "S")
+        if open_market_only:
+            trades = [t for t in trades if t.get("code") in ("P", "S")]
+        trades.sort(key=lambda t: t.get("date") or "", reverse=True)
+        return _result(
+            {
+                "symbol": ticker_name(symbol),
+                "filings_parsed": len(filings),
+                "open_market_bought": bought,
+                "open_market_sold": sold,
+                "net": bought - sold,
+                "trades": trades[:40],
+            },
+            delayed=False,
+        )
+
+    return _safe_call(symbol, fetch)
+
+
+@market_tool
+def get_analyst_view(symbol: str) -> dict[str, Any]:
+    """Finnhub analyst recommendation counts (latest month and the month before, with bullish_pct shift) plus the last 4 quarterly earnings vs estimate with surprise_pct. US/CA tickers. Use to judge consensus drift and whether the company habitually beats."""
+
+    def fetch():
+        key = _require_key("FINNHUB_API_KEY")
+        name = symbol.upper().strip()
+        recs = _aux_cached(
+            ("fh-rec", name), 3600, lambda: _http_json(FINNHUB_RECOMMENDATION_URL, {"symbol": name, "token": key}, allow_list=True)
+        )
+        earnings = _aux_cached(
+            ("fh-earn", name), 3600, lambda: _http_json(FINNHUB_EARNINGS_URL, {"symbol": name, "token": key}, allow_list=True)
+        )
+
+        def summarise(row):
+            counts = {k: int(row.get(k) or 0) for k in ("strongBuy", "buy", "hold", "sell", "strongSell")}
+            total = sum(counts.values())
+            return {
+                "period": row.get("period"),
+                "strong_buy": counts["strongBuy"],
+                "buy": counts["buy"],
+                "hold": counts["hold"],
+                "sell": counts["sell"],
+                "strong_sell": counts["strongSell"],
+                "bullish_pct": rounded((counts["strongBuy"] + counts["buy"]) / total * 100, 1) if total else None,
+            }
+
+        rows = sorted((r for r in recs if isinstance(r, dict)), key=lambda r: r.get("period") or "", reverse=True)[:2]
+        quarters = [
+            drop_nulls(
+                {
+                    "period": row.get("period"),
+                    "actual": rounded(row.get("actual"), 3),
+                    "estimate": rounded(row.get("estimate"), 3),
+                    "surprise_pct": rounded(row.get("surprisePercent"), 1),
+                }
+            )
+            for row in sorted((r for r in earnings if isinstance(r, dict)), key=lambda r: r.get("period") or "", reverse=True)[:4]
+        ]
+        if not rows and not quarters:
+            raise RuntimeError("no analyst data (US/CA tickers only)")
+        output: dict[str, Any] = {"symbol": name, "recs": [drop_nulls(summarise(row)) for row in rows], "earnings": quarters}
+        if len(output["recs"]) == 2 and None not in (output["recs"][0].get("bullish_pct"), output["recs"][1].get("bullish_pct")):
+            output["bullish_shift_pp"] = rounded(output["recs"][0]["bullish_pct"] - output["recs"][1]["bullish_pct"], 1)
+        return _result(output, delayed=False)
+
+    return _safe_call(symbol, fetch)
+
+
+RSS_FEEDS = {
+    "fed_press": "https://www.federalreserve.gov/feeds/press_all.xml",
+    "fed_monetary": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+    "fed_speeches": "https://www.federalreserve.gov/feeds/speeches.xml",
+    "ecb_press": "https://www.ecb.europa.eu/rss/press.xml",
+    "tagesschau_wirtschaft": "https://www.tagesschau.de/wirtschaft/index~rss2.xml",
+    "handelsblatt_finanzen": "https://www.handelsblatt.com/contentexport/feed/finanzen",
+    "marketwatch_top": "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "cnbc_business": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
+}
+CENTRAL_BANK_FEEDS = {
+    ("fed", "press"): "fed_press",
+    ("fed", "monetary"): "fed_monetary",
+    ("fed", "speeches"): "fed_speeches",
+    ("ecb", "press"): "ecb_press",
+}
+
+
+def _rss_rows(feed: str) -> list[dict[str, Any]]:
+    def load():
+        root = ET.fromstring(_http_text(RSS_FEEDS[feed], {"User-Agent": "Market-Data-MCP admin@example.com"}))
+        rows = []
+        for item in root.iter("item"):
+            stamp = None
+            try:
+                stamp = email.utils.parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                pass
+            summary = re.sub(r"<[^>]+>", " ", html.unescape(item.findtext("description") or ""))
+            rows.append(
+                {
+                    "headline": html.unescape(item.findtext("title") or ""),
+                    "source": feed,
+                    "summary": re.sub(r"\s+", " ", summary).strip(),
+                    "ts": stamp,
+                }
+            )
+        return rows
+
+    return _aux_cached(("rss", feed), NEWS_CACHE_TTL, load)
+
+
+def _feed_items(feed: str, n: int, query: str | None, summary_chars: int) -> list[dict[str, Any]]:
+    rows = _rss_rows(feed)
+    if query:
+        needle = query.lower()
+        rows = [row for row in rows if needle in f"{row['headline']} {row['summary']}".lower()]
+    items = _news_items(rows, max(1, min(n, 25)), summary_chars)
+    for item in items:
+        item.pop("source", None)
+    return items
+
+
+@market_tool
+def get_central_bank_news(bank: str = "fed", kind: str = "press", n: int = 5) -> dict[str, Any]:
+    """Latest official central-bank publications, newest first. bank=fed: kind press (all releases), monetary (FOMC statements, rate decisions) or speeches. bank=ecb: kind press (decisions, surveys, statements). n max 15. Headlines with a short summary and age_h; use right after a meeting or before a decision. Rate path and tone move every asset."""
+
+    def fetch():
+        feed = CENTRAL_BANK_FEEDS.get((bank.lower(), kind.lower()))
+        if not feed:
+            raise ValueError("use fed/press, fed/monetary, fed/speeches or ecb/press")
+        items = _feed_items(feed, min(n, 15), None, 240)
+        return _result({"bank": bank.lower(), "kind": kind.lower(), "count": len(items), "items": items}, delayed=False)
+
+    return _safe_call(bank, fetch)
+
+
+@market_tool
+def get_feed_news(feed: str = "handelsblatt_finanzen", n: int = 10, query: str | None = None) -> dict[str, Any]:
+    """Free no-key RSS market news. feed: handelsblatt_finanzen (DE, DAX/markets), tagesschau_wirtschaft (DE economy), marketwatch_top (US markets), cnbc_business (US business), plus central-bank feeds fed_press, fed_monetary, fed_speeches, ecb_press. Optional query keeps items whose headline or summary contains it (case-insensitive, e.g. "DAX", "Zinsen"). n max 25. German feeds return German text; use for DAX/European names where Finnhub and NewsAPI are thin."""
+
+    def fetch():
+        if feed not in RSS_FEEDS:
+            raise ValueError(f"feed must be one of {', '.join(RSS_FEEDS)}")
+        items = _feed_items(feed, n, query, 200)
+        return _result({"feed": feed, "count": len(items), "items": items}, delayed=False)
+
+    return _safe_call(feed, fetch)
 
 
 @market_tool
