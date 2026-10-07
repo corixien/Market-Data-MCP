@@ -352,18 +352,33 @@ def _http_json(
     params: dict[str, Any],
     headers: dict[str, str] | None = None,
     allow_list: bool = False,
+    timeout: float = 8,
 ) -> Any:
     request = UrlRequest(
         f"{url}?{urlencode(params)}",
         headers={"Accept": "application/json", **(headers or {})},
     )
+    secrets = [str(v) for v in [*params.values(), *(headers or {}).values()] if len(str(v)) >= 12]
+
+    def redact(text: str) -> str:
+        for secret in secrets:
+            text = text.replace(secret, "***")
+        return text[:120]
+
     try:
-        with urlopen(request, timeout=8) as response:
+        with urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
-        raise RuntimeError(f"provider HTTP {error.code}") from error
+        detail = ""
+        try:
+            body = json.loads(error.read(2000).decode("utf-8", errors="replace"))
+            detail = str(body.get("code") or body.get("error_message") or body.get("error") or body.get("message") or "")
+        except Exception:
+            pass
+        raise RuntimeError(f"provider HTTP {error.code}" + (f" ({redact(detail)})" if detail else "")) from error
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise RuntimeError("provider request failed") from error
+        reason = getattr(error, "reason", None)
+        raise RuntimeError(f"provider request failed: {type(reason or error).__name__}") from error
     if not isinstance(payload, dict) and not (allow_list and isinstance(payload, list)):
         raise RuntimeError("provider returned an invalid response")
     return payload
@@ -1538,7 +1553,7 @@ def get_news_brief(symbol: str, n: int = 3) -> dict[str, Any]:
 
 
 def _require_key(name: str) -> str:
-    key = os.environ.get(name)
+    key = (os.environ.get(name) or "").strip().strip("\"'").strip()
     if not key:
         raise RuntimeError(f"{name} is not configured")
     return key
@@ -1588,9 +1603,24 @@ def _news_items(rows: list[dict[str, Any]], n: int, summary_chars: int) -> list[
     return items
 
 
-def _finnhub_company_rows(payload: list[Any], name: str) -> list[dict[str, Any]]:
-    """Finnhub tags broad market stories with many tickers. Keep stories that name the symbol
-    in `related` with at most 3 tickers; fall back to all stories if too few remain."""
+def _company_keyword(name: str, key: str) -> str | None:
+    """First distinctive word of the company name (Finnhub profile2), used to spot stories about it."""
+    try:
+        profile = _aux_cached(
+            ("fh-profile", name),
+            86400,
+            lambda: _http_json("https://finnhub.io/api/v1/stock/profile2", {"symbol": name, "token": key}),
+        )
+    except Exception:
+        return None
+    words = re.findall(r"[A-Za-z0-9&]+", str(profile.get("name") or ""))
+    return words[0] if words and len(words[0]) >= 3 else None
+
+
+def _finnhub_company_rows(payload: list[Any], name: str, keyword: str | None = None) -> list[dict[str, Any]]:
+    """Finnhub tags many market-wide stories with the queried ticker. Prefer stories whose
+    headline/summary name the company or ticker, then focused tags (<=3 tickers); fall back
+    to all stories if fewer than 3 qualify."""
     rows = [
         {
             "headline": row.get("headline"),
@@ -1602,6 +1632,10 @@ def _finnhub_company_rows(payload: list[Any], name: str) -> list[dict[str, Any]]
         for row in payload
         if isinstance(row, dict)
     ]
+    pattern = re.compile(rf"\b({re.escape(name)}|{re.escape(keyword)})\b" if keyword else rf"\b{re.escape(name)}\b", re.I)
+    mentioned = [row for row in rows if pattern.search(f"{row['headline'] or ''} {row['summary'] or ''}")]
+    if len(mentioned) >= 3:
+        return mentioned
     focused = [row for row in rows if name in row["tags"] and len(row["tags"]) <= 3]
     return focused if len(focused) >= 3 else rows
 
@@ -1624,7 +1658,7 @@ def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
             )
 
         payload = _aux_cached(("fh-news", name, start), NEWS_CACHE_TTL, load)
-        rows = _finnhub_company_rows(payload, name)
+        rows = _finnhub_company_rows(payload, name, _company_keyword(name, key))
         items = _news_items(rows, max(1, min(n, 20)), 200)
         output: dict[str, Any] = {"symbol": name, "days": (today - start).days, "count": len(items), "items": items}
         if not items:
@@ -1664,7 +1698,7 @@ def _newsapi_get(url: str, params: dict[str, Any]) -> dict[str, Any]:
         return _http_json(url, params, headers={"X-Api-Key": key})
     except RuntimeError as error:
         if "401" in str(error):
-            raise RuntimeError("NewsAPI rejected NEWSAPI_API_KEY (HTTP 401): check the key value in the host secrets") from error
+            raise RuntimeError(f"NewsAPI rejected NEWSAPI_API_KEY ({str(error).removeprefix('provider ')}); check the key value in the host secrets and redeploy") from error
         if "429" in str(error):
             raise RuntimeError("NewsAPI daily quota exhausted (HTTP 429)") from error
         raise
@@ -1773,9 +1807,9 @@ KEY_RELEASES = (
 )
 
 
-def _fred(path: str, params: dict[str, Any]) -> dict[str, Any]:
+def _fred(path: str, params: dict[str, Any], timeout: float = 8) -> dict[str, Any]:
     key = _require_key("FRED_API_KEY")
-    return _http_json(f"{FRED_API_URL}/{path}", {"api_key": key, "file_type": "json", **params})
+    return _http_json(f"{FRED_API_URL}/{path}", {"api_key": key, "file_type": "json", **params}, timeout=timeout)
 
 
 def _fred_observations(series_id: str, units: str, limit: int) -> list[tuple[str, float]]:
@@ -1902,38 +1936,71 @@ def get_economic_calendar(days: int = 14, all_releases: bool = False) -> dict[st
     def fetch():
         today = datetime.now(timezone.utc).date()
         end = today + timedelta(days=max(1, min(days, 60)))
-        def load():
-            rows: list[dict[str, Any]] = []
-            for offset in range(0, 5000, 1000):  # FRED caps limit at 1000 per call
-                page = _fred(
-                    "releases/dates",
-                    {
-                        "realtime_start": today.isoformat(),
-                        "realtime_end": end.isoformat(),
-                        "include_release_dates_with_no_data": "true",
-                        "order_by": "release_date",
-                        "sort_order": "asc",
-                        "limit": 1000,
-                        "offset": offset,
-                    },
-                ).get("release_dates") or []
-                rows.extend(page)
-                if len(page) < 1000:
-                    break
-            return {"release_dates": rows}
-
-        payload = _aux_cached(("fred-calendar", today, end), MACRO_CACHE_TTL, load)
         events = []
-        for row in payload.get("release_dates") or []:
-            name = row.get("release_name") or ""
-            if not all_releases and not any(part in name.lower() for part in KEY_RELEASES):
-                continue
+
+        def add(release: str, stamp: str):
             try:
-                when = date.fromisoformat(row["date"])
-            except (KeyError, ValueError):
-                continue
+                when = date.fromisoformat(stamp)
+            except ValueError:
+                return
             if today <= when <= end:
-                events.append({"date": row["date"], "in_days": (when - today).days, "release": name})
+                events.append({"date": stamp, "in_days": (when - today).days, "release": release})
+
+        if all_releases:
+            def load_all():
+                rows: list[dict[str, Any]] = []
+                for offset in range(0, 5000, 1000):  # FRED caps limit at 1000 per call
+                    page = _fred(
+                        "releases/dates",
+                        {
+                            "realtime_start": today.isoformat(),
+                            "realtime_end": end.isoformat(),
+                            "include_release_dates_with_no_data": "true",
+                            "order_by": "release_date",
+                            "sort_order": "asc",
+                            "limit": 1000,
+                            "offset": offset,
+                        },
+                        timeout=25,
+                    ).get("release_dates") or []
+                    rows.extend(page)
+                    if len(page) < 1000:
+                        break
+                return rows
+
+            for row in _aux_cached(("fred-calendar-all", today, end), MACRO_CACHE_TTL, load_all):
+                add(row.get("release_name") or "", row.get("date") or "")
+        else:
+            # Small per-release calls (release id resolved by name) instead of one huge bulk call.
+            releases = _aux_cached(("fred-releases",), 86400, lambda: _fred("releases", {"limit": 1000}, timeout=20))
+            wanted = [
+                (row["id"], row["name"])
+                for row in releases.get("releases") or []
+                if any(part in str(row.get("name", "")).lower() for part in KEY_RELEASES)
+            ]
+
+            def one(item):
+                release_id, name = item
+                rows = _aux_cached(
+                    ("fred-release-dates", release_id, today),
+                    MACRO_CACHE_TTL,
+                    lambda: _fred(
+                        "release/dates",
+                        {
+                            "release_id": release_id,
+                            "include_release_dates_with_no_data": "true",
+                            "sort_order": "desc",
+                            "limit": 40,
+                        },
+                    ).get("release_dates") or [],
+                )
+                return [(name, row.get("date") or "") for row in rows]
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for batch in pool.map(one, wanted):
+                    for name, stamp in batch:
+                        add(name, stamp)
+        events.sort(key=lambda item: item["date"])
         return _result({"count": len(events), "events": events}, delayed=False)
 
     return _safe_call("calendar", fetch)
