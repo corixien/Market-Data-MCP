@@ -103,6 +103,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 
 - 2026-10-07 - second live-test round: `get_economic_calendar` now resolves key release ids via `fred/releases` and fetches `release/dates` per id (bulk call timed out); `_http_json` errors now carry provider code (for example `apiKeyInvalid`) and timeout/exception type, secrets redacted; `_require_key` strips whitespace/quotes; `get_company_news` prefers stories naming the company (Finnhub `profile2`).
 
+- 2026-10-07 - `search_news` default sort now relevancy with searchIn title,description (publishedAt returned off-topic items); beta window difference documented in `compare`/`get_fundamentals_brief` docstrings.
+
 ## 8. Resume prompt
 Paste this into a new session:
 > Read project-resume.md in this project fully. Read every file it lists under "Must read before any change". Then continue from "Current state". Do not change anything before you have understood the project. Keep project-resume.md updated.

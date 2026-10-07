@@ -1338,7 +1338,7 @@ def compare(
     period: str = "6mo",
     benchmark: str = "SPY",
 ) -> dict[str, Any]:
-    """Relative comparison of 2-50 tickers vs a benchmark in one call: return, beta, correlation, max drawdown, annualised volatility, plus correlation matrix. Use for pair/rotation/diversification questions."""
+    """Relative comparison of 2-50 tickers vs a benchmark in one call: return, beta, correlation, max drawdown, annualised volatility, plus correlation matrix. beta here is daily beta vs the benchmark over `period` (default 6mo), so it differs from the Yahoo 5y monthly beta in get_fundamentals_brief. Use for pair/rotation/diversification questions."""
     symbols = list(dict.fromkeys(symbols))
     requested = symbols + ([] if benchmark in symbols else [benchmark])
     frames, cached, as_of = download_batch(requested, period=period, interval="1d")
@@ -1386,7 +1386,7 @@ def compare(
 
 @market_tool
 def get_fundamentals_brief(symbol: str) -> dict[str, Any]:
-    """Key fundamentals for one stock: market cap ($B), PE, fwd PE, growth, margin, debt/equity, dividend yield %, beta, short % float, analyst target/upside/rating, next earnings date, sector. ETFs/crypto return few fields."""
+    """Key fundamentals for one stock: market cap ($B), PE, fwd PE, growth, margin, debt/equity, dividend yield %, beta (Yahoo 5y monthly; compare() gives short-window beta), short % float, analyst target/upside/rating, next earnings date, sector. ETFs/crypto return few fields."""
 
     def fetch():
         info = yf.Ticker(symbol).info
@@ -1723,19 +1723,26 @@ def _newsapi_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def search_news(
     query: str,
     days: int = 7,
-    sort: str = "publishedAt",
+    sort: str = "relevancy",
     n: int = 8,
     domains: str | None = None,
     language: str = "en",
 ) -> dict[str, Any]:
-    """NewsAPI keyword search across thousands of publishers: companies, products, people, themes, events ("Nvidia export ban", "OPEC cut", "bank run"). Boolean operators and quotes work in query (AND, OR, NOT, "exact phrase"). days max 30; sort publishedAt | relevancy | popularity; n max 20; domains comma list e.g. "reuters.com,bloomberg.com". Free plan: articles are 24 h delayed and quota is 100 calls/day (cached 10 min), so prefer get_company_news / get_market_news for fresh ticker news."""
+    """NewsAPI keyword search across thousands of publishers: companies, products, people, themes, events ("Nvidia export ban", "OPEC cut", "bank run"). Boolean operators and quotes work in query (AND, OR, NOT, "exact phrase"). days max 30; sort relevancy (default, on-topic) | publishedAt (newest, can drift off-topic) | popularity; matches title/description only; n max 20; domains comma list e.g. "reuters.com,bloomberg.com". Free plan: articles are 24 h delayed and quota is 100 calls/day (cached 10 min), so prefer get_company_news / get_market_news for fresh ticker news."""
 
     def fetch():
         if sort not in ("publishedAt", "relevancy", "popularity"):
             raise ValueError("sort must be publishedAt, relevancy or popularity")
         _require_key("NEWSAPI_API_KEY")
         start = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))).date().isoformat()
-        params = {"q": query, "from": start, "sortBy": sort, "language": language, "pageSize": 30}
+        params = {
+            "q": query,
+            "from": start,
+            "sortBy": sort,
+            "language": language,
+            "pageSize": 30,
+            "searchIn": "title,description",
+        }
         if domains:
             params["domains"] = domains
         payload = _aux_cached(
