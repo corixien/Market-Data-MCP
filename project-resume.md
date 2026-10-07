@@ -2,7 +2,7 @@
 
 > Instruction for Claude: read this whole file first. Then read every file under "Must read before any change". Do not modify anything until you have fully understood the project. Keep this file updated as you work (see "Maintenance rules").
 
-Last updated: 2026-10-06
+Last updated: 2026-10-07
 
 ## 1. What this project is
 Read-only market-data MCP server (Python 3.12, FastMCP 4). Exposes trading/analysis tools over Streamable HTTP at `/mcp`. Backed by yfinance, with live quote providers (CoinGecko, Finnhub, Alpaca websocket) and yfinance fallback. Hosted on Prefect Horizon (free, deploys from GitHub `main`, entrypoint `main.py:mcp`, OAuth enforced); previously Replit/Cloud Run (`.replit`, still works via `python main.py`). Consumed by Claude (the `mbs-agent`/`trading-agent` skills use it as the "yfinance-market-data" MCP server). No account/broker access.
@@ -25,7 +25,7 @@ Read-only market-data MCP server (Python 3.12, FastMCP 4). Exposes trading/analy
 - `attached_assets/` - pasted Replit prompts/logs; reference only.
 - `.agents/memory/` - agent memory notes (tracked in git).
 - Routes: `/` text homepage, `/healthz` health JSON, `/mcp` MCP transport (DNS-rebinding protection intentionally disabled for Replit proxy).
-- Tools in `main.py`: `get_price`, `get_quote`, `get_historical_data`, `get_batch_historical_data`, `get_analysis`, `get_trade_setup`, `scan_watchlist`, `market_snapshot`, `compare`, `get_fundamentals_brief`, `get_events`, `get_options_brief`, `get_news_brief`, `position_calc`, `position_size`.
+- Tools in `main.py`: `get_price`, `get_quote`, `get_historical_data`, `get_batch_historical_data`, `get_analysis`, `get_trade_setup`, `scan_watchlist`, `market_snapshot`, `compare`, `get_fundamentals_brief`, `get_events`, `get_options_brief`, `get_news_brief`, `position_calc`, `position_size`, plus news/macro: `get_company_news`, `get_market_news`, `search_news`, `get_top_headlines`, `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar`.
 - Lookup:
   - Quote provider routing -> `_available_providers`, `_quote_base`, `PROVIDER_DELAYS` (main.py)
   - Trade setup logic/params -> `SETUP_STYLES`, `SETUP_PARAMS`, `_build_setup`
@@ -41,7 +41,7 @@ Run from project root.
 - Run: `python main.py` (use `python`, not `python3`, for Cloud Run).
 - Health: `curl localhost:5000/healthz`.
 - No tests, linter, or CI in repo.
-- Env vars (set in the Horizon server settings or Replit secrets, never in repo): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_STREAM_URL` (optional), `FINNHUB_API_KEY`, `COINGECKO_API_KEY`, `PORT`.
+- Env vars (set in the Horizon server settings or Replit secrets, never in repo): `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_STREAM_URL` (optional), `FINNHUB_API_KEY` (quotes and news), `COINGECKO_API_KEY`, `NEWSAPI_API_KEY`, `FRED_API_KEY`, `PORT`.
 - Deploy: push to `main`; Horizon redeploys automatically. Set the secrets in Horizon, entrypoint `main.py:mcp`. Retest `/mcp` after each deploy.
 
 ## 5. Invariants and gotchas
@@ -81,7 +81,7 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - [x] Provider test: CoinGecko/Finnhub/Alpaca delay 0 or ~1 min, yfinance fallback. Alpaca failed earlier only because Replit Deployment was stale/lacked secrets; fixed by republish.
 
 ### In progress
-- (none)
+- [x] News and macro tools (Finnhub news, NewsAPI, FRED) added 2026-10-07; tested with mocked providers only. Needs live check on Horizon after `NEWSAPI_API_KEY` and `FRED_API_KEY` secrets are set.
 
 ### Next steps
 1. Await user go-ahead for an ISIN -> ticker resolver tool (`yf.Search`) for Deka ETFs and the 215 ETCs; needs the ETC ISIN list.
@@ -94,6 +94,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - 2026-10-05 - no new provider added; ISIN resolver tool proposed, awaiting user go-ahead.
 - 2026-10-05 - project-resume.md created and tracked in git (user decision).
 - 2026-10-05 - Alpaca quotes stay IEX-only, no yfinance field fill-in.
+
+- 2026-10-07 - added news (Finnhub, NewsAPI) and macro (FRED) tools in `main.py`; NewsAPI free plan is 24 h delayed, 100 calls/day, so results are cached 10 min and Finnhub is the fresh source.
 
 ## 8. Resume prompt
 Paste this into a new session:

@@ -11,6 +11,10 @@ Verified live on the deployed server 2026-10-05 (then on Replit; now hosted on P
 | Alpaca | Websocket `wss://stream.data.alpaca.markets/v2/iex` (trades) + REST snapshot for prev close | `ALPACA_API_KEY`, `ALPACA_API_SECRET` | 0 (live, IEX feed) | 1 websocket connection, 30 symbols (code evicts LRU), REST 200 calls/min, REST data 15 min late | Other US tickers (`US_EQUITY_RE`): price, chg, prev close. No day high/low/volume |
 | yfinance | Python lib (Yahoo, unofficial, no key) | none | declared 15 min; observed 1-3 min | No official limit; IP throttling possible under heavy use | Everything else and fallback: history, indicators, fundamentals, options, news, non-US, forex, futures, indices |
 
+| Finnhub news | REST `/company-news`, `/news`, `token` param (same key as quotes) | `FINNHUB_API_KEY` | near live | 60 calls/min shared with quotes; US/CA company news | `get_company_news`, `get_market_news` |
+| NewsAPI | REST `newsapi.org/v2/everything`, `/top-headlines`, header `X-Api-Key` | `NEWSAPI_API_KEY` | 24 h on free plan | 100 calls/day, `from` max 30 days back; responses cached 10 min | `search_news`, `get_top_headlines` |
+| FRED | REST `api.stlouisfed.org/fred`, `api_key` param | `FRED_API_KEY` | release schedule | 120 calls/min; responses cached 1 h | `get_macro_snapshot`, `get_macro_series`, `search_macro_series`, `get_economic_calendar` |
+
 Routing (`_available_providers` in `main.py`): least declared delay first. Crypto -> CoinGecko; else Finnhub (listed symbols) then Alpaca (US tickers); yfinance always last. Failed providers are listed in `fallback_from`. Quotes cache 30 s, so repeated calls cost nothing.
 
 Burst warning: `get_quote` with up to 50 Finnhub symbols fires up to 50 calls at once (8 threads), close to the 60/min cap. Beyond that Finnhub fails and yfinance answers.

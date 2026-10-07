@@ -59,6 +59,13 @@ MAX_BATCH_TICKERS = 50
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
 FINNHUB_API_URL = "https://finnhub.io/api/v1/quote"
 ALPACA_SNAPSHOT_URL = "https://data.alpaca.markets/v2/stocks/{symbol}/snapshot"
+FINNHUB_COMPANY_NEWS_URL = "https://finnhub.io/api/v1/company-news"
+FINNHUB_MARKET_NEWS_URL = "https://finnhub.io/api/v1/news"
+NEWSAPI_EVERYTHING_URL = "https://newsapi.org/v2/everything"
+NEWSAPI_HEADLINES_URL = "https://newsapi.org/v2/top-headlines"
+FRED_API_URL = "https://api.stlouisfed.org/fred"
+NEWS_CACHE_TTL = 600
+MACRO_CACHE_TTL = 3600
 YFINANCE_DELAY_MINUTES = 15
 # Declared delay per provider (minutes). Lowest delay is tried first, ties keep list order.
 PROVIDER_DELAYS = {"coingecko": 0, "finnhub": 0, "alpaca": 0, "yfinance-mcp": YFINANCE_DELAY_MINUTES}
@@ -216,9 +223,12 @@ mcp = FastMCP(
         "to rank many tickers in one call and get_trade_setup for a fresh-entry plan. "
         "Prices: the provider with the least delay for the ticker is used (CoinGecko for recognized crypto, "
         "Finnhub for Dow 30/Nasdaq 100 and common ETFs, Alpaca websocket for other US stocks), "
-        "yfinance otherwise or as fallback. Each response has as_of and delayed; delayed=false means live."
+        "yfinance otherwise or as fallback. Each response has as_of and delayed; delayed=false means live. "
+        "News: get_company_news / get_market_news (Finnhub, fresh), search_news / get_top_headlines (NewsAPI, "
+        "24 h delayed, 100 calls/day). Macro: get_macro_snapshot first, then get_macro_series, "
+        "search_macro_series, get_economic_calendar (FRED)."
     ),
-    version="2.1.0",
+    version="2.2.0",
 )
 
 def market_tool(function):
@@ -331,7 +341,8 @@ def _http_json(
     url: str,
     params: dict[str, Any],
     headers: dict[str, str] | None = None,
-) -> dict[str, Any]:
+    allow_list: bool = False,
+) -> Any:
     request = UrlRequest(
         f"{url}?{urlencode(params)}",
         headers={"Accept": "application/json", **(headers or {})},
@@ -343,7 +354,7 @@ def _http_json(
         raise RuntimeError(f"provider HTTP {error.code}") from error
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
         raise RuntimeError("provider request failed") from error
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) and not (allow_list and isinstance(payload, list)):
         raise RuntimeError("provider returned an invalid response")
     return payload
 
@@ -1507,6 +1518,376 @@ def get_news_brief(symbol: str, n: int = 3) -> dict[str, Any]:
         return _result({"symbol": ticker_name(symbol), "items": items})
 
     return _safe_call(symbol, fetch)
+
+
+def _require_key(name: str) -> str:
+    key = os.environ.get(name)
+    if not key:
+        raise RuntimeError(f"{name} is not configured")
+    return key
+
+
+def _age_hours_exact(value: Any) -> float:
+    """Hours since value (epoch seconds or ISO string); inf when unparseable so it sorts last."""
+    try:
+        if isinstance(value, (int, float)):
+            stamp = datetime.fromtimestamp(value, timezone.utc)
+        else:
+            stamp = pd.Timestamp(value).tz_convert("UTC").to_pydatetime()
+        return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds() / 3600)
+    except Exception:
+        return math.inf
+
+
+def _age_hours(value: Any) -> int | None:
+    age = _age_hours_exact(value)
+    return None if math.isinf(age) else round(age)
+
+
+def _news_items(rows: list[dict[str, Any]], n: int, summary_chars: int) -> list[dict[str, Any]]:
+    """Dedupe by headline, newest first, compact fields. No links or bodies (token savings)."""
+    items, seen = [], set()
+    for row in sorted(rows, key=lambda item: _age_hours_exact(item["ts"])):
+        headline = (row.get("headline") or "").strip()
+        key = headline.lower()[:80]
+        if not headline or headline == "[Removed]" or key in seen:
+            continue
+        seen.add(key)
+        summary = (row.get("summary") or "").strip()
+        if summary == "[Removed]" or summary.lower().startswith(key[:40]):
+            summary = ""
+        items.append(
+            drop_nulls(
+                {
+                    "headline": headline,
+                    "source": row.get("source"),
+                    "age_h": _age_hours(row["ts"]) if row["ts"] else None,
+                    "summary": summary[:summary_chars] or None,
+                }
+            )
+        )
+        if len(items) >= n:
+            break
+    return items
+
+
+@market_tool
+def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
+    """Finnhub company news for a US/CA ticker: last `days` (max 30), n items (max 20), newest first, with source, age_h and a short summary. Richer and longer-range than get_news_brief. Non-US tickers return no items; use get_news_brief or search_news for those."""
+
+    def fetch():
+        key = _require_key("FINNHUB_API_KEY")
+        name = symbol.upper().strip()
+        today = datetime.now(timezone.utc).date()
+        start = today - timedelta(days=max(1, min(days, 30)))
+
+        def load():
+            return _http_json(
+                FINNHUB_COMPANY_NEWS_URL,
+                {"symbol": name, "from": start.isoformat(), "to": today.isoformat(), "token": key},
+                allow_list=True,
+            )
+
+        payload = _aux_cached(("fh-news", name, start), NEWS_CACHE_TTL, load)
+        rows = [
+            {"headline": row.get("headline"), "source": row.get("source"), "summary": row.get("summary"), "ts": row.get("datetime")}
+            for row in payload
+            if isinstance(row, dict)
+        ]
+        items = _news_items(rows, max(1, min(n, 20)), 200)
+        output: dict[str, Any] = {"symbol": name, "days": (today - start).days, "count": len(items), "items": items}
+        if not items:
+            output["note"] = "no Finnhub news; non-US tickers: use get_news_brief or search_news"
+        return _result(output, delayed=False)
+
+    return _safe_call(symbol, fetch)
+
+
+@market_tool
+def get_market_news(category: str = "general", n: int = 10) -> dict[str, Any]:
+    """Finnhub market-wide news, newest first. category: general, forex, crypto or merger (M&A). n max 25. Use for the day's macro/market narrative before trading, or crypto/forex/M&A flow."""
+
+    def fetch():
+        if category not in ("general", "forex", "crypto", "merger"):
+            raise ValueError("category must be general, forex, crypto or merger")
+        key = _require_key("FINNHUB_API_KEY")
+        payload = _aux_cached(
+            ("fh-market-news", category),
+            NEWS_CACHE_TTL,
+            lambda: _http_json(FINNHUB_MARKET_NEWS_URL, {"category": category, "token": key}, allow_list=True),
+        )
+        rows = [
+            {"headline": row.get("headline"), "source": row.get("source"), "summary": row.get("summary"), "ts": row.get("datetime")}
+            for row in payload
+            if isinstance(row, dict)
+        ]
+        items = _news_items(rows, max(1, min(n, 25)), 160)
+        return _result({"category": category, "count": len(items), "items": items}, delayed=False)
+
+    return _safe_call(category, fetch)
+
+
+def _newsapi_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"NewsAPI {payload.get('code') or 'error'}")
+    return [
+        {
+            "headline": row.get("title"),
+            "source": (row.get("source") or {}).get("name"),
+            "summary": row.get("description"),
+            "ts": row.get("publishedAt"),
+        }
+        for row in payload.get("articles") or []
+        if isinstance(row, dict)
+    ]
+
+
+@market_tool
+def search_news(
+    query: str,
+    days: int = 7,
+    sort: str = "publishedAt",
+    n: int = 8,
+    domains: str | None = None,
+    language: str = "en",
+) -> dict[str, Any]:
+    """NewsAPI keyword search across thousands of publishers: companies, products, people, themes, events ("Nvidia export ban", "OPEC cut", "bank run"). Boolean operators and quotes work in query (AND, OR, NOT, "exact phrase"). days max 30; sort publishedAt | relevancy | popularity; n max 20; domains comma list e.g. "reuters.com,bloomberg.com". Free plan: articles are 24 h delayed and quota is 100 calls/day (cached 10 min), so prefer get_company_news / get_market_news for fresh ticker news."""
+
+    def fetch():
+        if sort not in ("publishedAt", "relevancy", "popularity"):
+            raise ValueError("sort must be publishedAt, relevancy or popularity")
+        key = _require_key("NEWSAPI_API_KEY")
+        start = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))).date().isoformat()
+        params = {"q": query, "from": start, "sortBy": sort, "language": language, "pageSize": 30}
+        if domains:
+            params["domains"] = domains
+        payload = _aux_cached(
+            ("newsapi-search", tuple(sorted(params.items()))),
+            NEWS_CACHE_TTL,
+            lambda: _http_json(NEWSAPI_EVERYTHING_URL, params, headers={"X-Api-Key": key}),
+        )
+        items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 200)
+        return _result(
+            {"query": query, "total": payload.get("totalResults"), "count": len(items), "items": items},
+            delayed=True,
+        )
+
+    return _safe_call(query, fetch)
+
+
+@market_tool
+def get_top_headlines(category: str = "business", country: str = "us", query: str | None = None, n: int = 10) -> dict[str, Any]:
+    """NewsAPI top headlines now. category: business, technology, general, science, health, sports, entertainment. country: 2-letter code (us, gb, de ...). Optional query filters inside the category. n max 20. Quota 100 calls/day (cached 10 min)."""
+
+    def fetch():
+        if category not in ("business", "technology", "general", "science", "health", "sports", "entertainment"):
+            raise ValueError("invalid category")
+        key = _require_key("NEWSAPI_API_KEY")
+        params: dict[str, Any] = {"category": category, "country": country.lower(), "pageSize": 30}
+        if query:
+            params["q"] = query
+        payload = _aux_cached(
+            ("newsapi-top", tuple(sorted(params.items()))),
+            NEWS_CACHE_TTL,
+            lambda: _http_json(NEWSAPI_HEADLINES_URL, params, headers={"X-Api-Key": key}),
+        )
+        items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 160)
+        return _result({"category": category, "country": country.lower(), "count": len(items), "items": items}, delayed=True)
+
+    return _safe_call(category, fetch)
+
+
+FRED_UNITS = {"lin", "chg", "ch1", "pch", "pc1", "pca", "cch", "cca", "log"}
+# label -> (FRED series id, units transformation, note)
+MACRO_SNAPSHOT = {
+    "fed_funds_pct": ("DFF", "lin"),
+    "us2y_pct": ("DGS2", "lin"),
+    "us10y_pct": ("DGS10", "lin"),
+    "curve_10y_2y_pp": ("T10Y2Y", "lin"),
+    "real_10y_pct": ("DFII10", "lin"),
+    "breakeven_10y_pct": ("T10YIE", "lin"),
+    "hy_spread_pp": ("BAMLH0A0HYM2", "lin"),
+    "cpi_yoy_pct": ("CPIAUCSL", "pc1"),
+    "core_cpi_yoy_pct": ("CPILFESL", "pc1"),
+    "core_pce_yoy_pct": ("PCEPILFE", "pc1"),
+    "unemployment_pct": ("UNRATE", "lin"),
+    "payrolls_chg_k": ("PAYEMS", "chg"),
+    "jobless_claims": ("ICSA", "lin"),
+    "gdp_qoq_ann_pct": ("A191RL1Q225SBEA", "lin"),
+}
+KEY_RELEASES = (
+    "consumer price index",
+    "employment situation",
+    "gross domestic product",
+    "personal income and outlays",
+    "producer price index",
+    "advance monthly sales for retail",
+    "job openings and labor turnover",
+    "unemployment insurance weekly claims",
+    "fomc press release",
+    "industrial production and capacity",
+    "employment cost index",
+)
+
+
+def _fred(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    key = _require_key("FRED_API_KEY")
+    return _http_json(f"{FRED_API_URL}/{path}", {"api_key": key, "file_type": "json", **params})
+
+
+def _fred_observations(series_id: str, units: str, limit: int) -> list[tuple[str, float]]:
+    """Newest first, missing values ('.') dropped."""
+    payload = _aux_cached(
+        ("fred-obs", series_id, units, limit),
+        MACRO_CACHE_TTL,
+        lambda: _fred(
+            "series/observations",
+            {"series_id": series_id, "units": units, "sort_order": "desc", "limit": limit + 5},
+        ),
+    )
+    rows = []
+    for row in payload.get("observations") or []:
+        try:
+            rows.append((row["date"], float(row["value"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows[:limit]
+
+
+@market_tool
+def get_macro_snapshot() -> dict[str, Any]:
+    """FRED macro dashboard in one call: fed funds, 2y/10y yields, 10y-2y curve, real 10y, 10y breakeven, HY spread, CPI/core CPI/core PCE YoY, unemployment, payrolls change (k), jobless claims, real GDP QoQ annualized. Each: v (latest), prev, date. Use to set the macro regime (rates, inflation, labor, credit stress) before judging index or sector trades."""
+
+    def fetch():
+        _require_key("FRED_API_KEY")
+
+        def one(item):
+            label, (series_id, units) = item
+            try:
+                rows = _fred_observations(series_id, units, 2)
+            except Exception:
+                return label, None
+            if not rows:
+                return label, None
+            data = {"v": rounded(rows[0][1], 3), "date": rows[0][0]}
+            if len(rows) > 1:
+                data["prev"] = rounded(rows[1][1], 3)
+            return label, data
+
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            results = dict(pool.map(one, MACRO_SNAPSHOT.items()))
+        data = {label: value for label, value in results.items() if value}
+        if not data:
+            raise RuntimeError("FRED returned no data")
+        missing = [label for label, value in results.items() if not value]
+        return _result({"data": data, "missing": missing or None}, delayed=False)
+
+    return _safe_call("macro", fetch)
+
+
+@market_tool
+def get_macro_series(series_id: str, n: int = 12, units: str = "lin") -> dict[str, Any]:
+    """Any FRED series by id (find ids with search_macro_series): title, frequency, units, and the latest n observations oldest first as [date, value] (n max 120). units transform: lin level, chg change, ch1 change vs year ago, pch % change, pc1 % change vs year ago (YoY), pca annualized % change, cch/cca continuously compounded, log. Examples: CPIAUCSL, UNRATE, DGS10, T10Y2Y, ICSA, M2SL, VIXCLS, DCOILWTICO."""
+
+    def fetch():
+        if units not in FRED_UNITS:
+            raise ValueError(f"units must be one of {', '.join(sorted(FRED_UNITS))}")
+        sid = series_id.upper().strip()
+        meta_payload = _aux_cached(
+            ("fred-meta", sid), 86400, lambda: _fred("series", {"series_id": sid})
+        )
+        meta = (meta_payload.get("seriess") or [{}])[0]
+        rows = _fred_observations(sid, units, max(1, min(n, 120)))
+        if not rows:
+            raise RuntimeError("no observations")
+        values = [rounded(value, 4) for _, value in reversed(rows)]
+        output = {
+            "series": sid,
+            "title": meta.get("title"),
+            "freq": meta.get("frequency_short"),
+            "units": meta.get("units_short") if units == "lin" else units,
+            "seasonal": meta.get("seasonal_adjustment_short"),
+            "latest": {"date": rows[0][0], "value": rounded(rows[0][1], 4)},
+            "obs": [[date, value] for (date, _), value in zip(reversed(rows), values)],
+        }
+        if len(rows) > 1:
+            output["chg_vs_prev"] = rounded(rows[0][1] - rows[1][1], 4)
+        return _result(output, delayed=False)
+
+    return _safe_call(series_id, fetch)
+
+
+@market_tool
+def search_macro_series(query: str, n: int = 8) -> dict[str, Any]:
+    """Find FRED series ids by keyword ("core inflation", "10 year treasury", "initial jobless claims"), most popular first. n max 20. Returns id, title, freq, units, last observation date. Feed the id into get_macro_series."""
+
+    def fetch():
+        payload = _aux_cached(
+            ("fred-search", query.lower(), n),
+            86400,
+            lambda: _fred(
+                "series/search",
+                {
+                    "search_text": query,
+                    "order_by": "popularity",
+                    "sort_order": "desc",
+                    "limit": max(1, min(n, 20)),
+                },
+            ),
+        )
+        items = [
+            drop_nulls(
+                {
+                    "id": row.get("id"),
+                    "title": row.get("title"),
+                    "freq": row.get("frequency_short"),
+                    "units": row.get("units_short"),
+                    "last": row.get("observation_end"),
+                }
+            )
+            for row in payload.get("seriess") or []
+        ]
+        return _result({"query": query, "count": len(items), "items": items}, delayed=False)
+
+    return _safe_call(query, fetch)
+
+
+@market_tool
+def get_economic_calendar(days: int = 14, all_releases: bool = False) -> dict[str, Any]:
+    """Upcoming US macro release dates from FRED within `days` (max 60), with in_days: CPI, jobs report, GDP, PCE, PPI, retail sales, JOLTS, jobless claims, FOMC, industrial production, ECI. all_releases=true lists every FRED release (long). Dates only, no consensus or actuals. Check before holding index/rate-sensitive trades through a release."""
+
+    def fetch():
+        today = datetime.now(timezone.utc).date()
+        end = today + timedelta(days=max(1, min(days, 60)))
+        payload = _aux_cached(
+            ("fred-calendar", today, end),
+            MACRO_CACHE_TTL,
+            lambda: _fred(
+                "releases/dates",
+                {
+                    "realtime_start": today.isoformat(),
+                    "realtime_end": end.isoformat(),
+                    "include_release_dates_with_no_data": "true",
+                    "order_by": "release_date",
+                    "sort_order": "asc",
+                    "limit": 5000,
+                },
+            ),
+        )
+        events = []
+        for row in payload.get("release_dates") or []:
+            name = row.get("release_name") or ""
+            if not all_releases and not any(part in name.lower() for part in KEY_RELEASES):
+                continue
+            try:
+                when = date.fromisoformat(row["date"])
+            except (KeyError, ValueError):
+                continue
+            if today <= when <= end:
+                events.append({"date": row["date"], "in_days": (when - today).days, "release": name})
+        return _result({"count": len(events), "events": events}, delayed=False)
+
+    return _safe_call("calendar", fetch)
 
 
 @market_tool
