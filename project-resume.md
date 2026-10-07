@@ -105,6 +105,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 
 - 2026-10-07 - `search_news` default sort now relevancy with searchIn title,description (publishedAt returned off-topic items); beta window difference documented in `compare`/`get_fundamentals_brief` docstrings.
 
+- 2026-10-07 - transient Yahoo empty frames: `get_history` retries (0.4 s, 1 s backoff) and `download_batch` re-requests only missing symbols, caching partial results 30 s instead of full TTL (`market_data.py` `_retry`, `RETRY_DELAYS`). `get_batch_historical_data` sets `partial: true` with `errors`, and returns an error when every ticker fails.
+
 ## 8. Resume prompt
 Paste this into a new session:
 > Read project-resume.md in this project fully. Read every file it lists under "Must read before any change". Then continue from "Current state". Do not change anything before you have understood the project. Keep project-resume.md updated.

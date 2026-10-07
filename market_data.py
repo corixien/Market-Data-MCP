@@ -149,6 +149,28 @@ def _normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+RETRY_DELAYS = (0.4, 1.0)  # seconds before 2nd and 3rd attempt; Yahoo intermittently returns empty frames
+PARTIAL_CACHE_TTL = 30
+
+
+def _retry(fetch, is_empty):
+    """Call fetch up to len(RETRY_DELAYS)+1 times while it raises or returns an empty result."""
+    result, error = None, None
+    for delay in (0, *RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            result, error = fetch(), None
+        except Exception as exc:
+            result, error = None, exc
+            continue
+        if not is_empty(result):
+            return result
+    if error is not None:
+        raise error
+    return result
+
+
 def get_history(
     ticker: str,
     period: str | None = "1mo",
@@ -182,7 +204,7 @@ def get_history(
         kwargs["start"] = start
     if end:
         kwargs["end"] = end
-    frame = _normalize_frame(yf.Ticker(ticker).history(**kwargs))
+    frame = _retry(lambda: _normalize_frame(yf.Ticker(ticker).history(**kwargs)), lambda item: item.empty)
     if frame.empty:
         raise NoData(f"{ticker}: no data")
     as_of = _as_of(frame)
@@ -231,21 +253,44 @@ def download_batch(
         frames, as_of = cached
         return frames, True, as_of
 
-    frame = yf.download(
-        tickers=symbols,
-        period=period,
-        interval=interval,
-        group_by="ticker",
-        auto_adjust=auto_adjust,
-        progress=False,
-        threads=True,
-        actions=False,
-    )
-    frames = _split_download(frame, symbols)
-    if not frames:
+    def download(names: list[str]) -> dict[str, pd.DataFrame]:
+        frame = yf.download(
+            tickers=names,
+            period=period,
+            interval=interval,
+            group_by="ticker",
+            auto_adjust=auto_adjust,
+            progress=False,
+            threads=True,
+            actions=False,
+        )
+        return _split_download(frame, names)
+
+    def missing_from(found: dict[str, pd.DataFrame]) -> list[str]:
+        return [name for name in symbols if name not in found or found[name].empty]
+
+    # Yahoo intermittently returns an empty frame for single symbols; re-request only those.
+    try:
+        frames = download(symbols)
+    except Exception:
+        frames = {}
+    for delay in RETRY_DELAYS:
+        missing = missing_from(frames)
+        if not missing:
+            break
+        time.sleep(delay)
+        try:
+            extra = download(missing)
+        except Exception:
+            continue
+        frames.update({name: item for name, item in extra.items() if not item.empty})
+    if all(item.empty for item in frames.values()):
         raise NoData(f"{symbols[0]}: no data")
     newest = max((_as_of(item) for item in frames.values() if not item.empty), default=None)
-    _cache_write(key, frames, _history_ttl(interval), newest)
+    # A result with symbols still missing is cached briefly so the next call retries instead of
+    # serving the gap for the full TTL.
+    ttl = _history_ttl(interval) if not missing_from(frames) else min(_history_ttl(interval), PARTIAL_CACHE_TTL)
+    _cache_write(key, frames, ttl, newest)
     return frames, False, newest
 
 

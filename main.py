@@ -927,9 +927,12 @@ def get_batch_historical_data(
             newest = max(filter(None, [newest, as_of]), default=newest)
         except Exception:
             errors[ticker_name(symbol)] = f"{ticker_name(symbol)}: no data"
+    if errors and not data:
+        return {"error": f"no data for {', '.join(errors)}"}
     output: dict[str, Any] = {"data": data}
     if errors:
         output["errors"] = errors
+        output["partial"] = True
     return _result(output, newest)
 
 
