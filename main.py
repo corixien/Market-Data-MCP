@@ -1654,6 +1654,15 @@ def _age_hours(value: Any) -> int | None:
     return None if math.isinf(age) else round(age)
 
 
+def _news_date(value: Any) -> str | None:
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, timezone.utc).date().isoformat()
+        return pd.Timestamp(value).date().isoformat()
+    except Exception:
+        return None
+
+
 NEWS_STOP_WORDS = {"the", "and", "with", "for", "from", "that", "its", "after", "says", "will", "has", "are", "was"}
 
 
@@ -1686,6 +1695,7 @@ def _news_items(
                     "headline": headline,
                     "source": row.get("source"),
                     "age_h": _age_hours(row["ts"]) if row["ts"] else None,
+                    "date": _news_date(row["ts"]) if row["ts"] and _age_hours_exact(row["ts"]) > 168 else None,
                     "summary": summary[:summary_chars] or None,
                 }
             )
@@ -1752,29 +1762,73 @@ def _finnhub_company_rows(payload: list[Any], name: str, keyword: str | None = N
     return good if len(good) >= 3 else rows
 
 
+NEWS_WINDOW_DAYS = 30
+NEWS_MAX_WINDOWS = 240  # 20 years of 30-day windows per call
+
+
+def _news_range(days: int, start: str | None, end: str | None) -> tuple[date, date]:
+    """Resolve [start, end] (ISO dates) or the last `days` days; no upper bound on the span."""
+    try:
+        last = date.fromisoformat(end) if end else datetime.now(timezone.utc).date()
+        first = date.fromisoformat(start) if start else last - timedelta(days=max(1, days))
+    except ValueError as error:
+        raise ValueError("start/end must be ISO dates YYYY-MM-DD") from error
+    if first > last:
+        raise ValueError("start must not be after end")
+    return first, last
+
+
+def _news_windows(first: date, last: date, step: int = NEWS_WINDOW_DAYS) -> list[tuple[date, date]]:
+    windows, cursor = [], first
+    while cursor <= last:
+        windows.append((cursor, min(cursor + timedelta(days=step - 1), last)))
+        cursor += timedelta(days=step)
+    if len(windows) > NEWS_MAX_WINDOWS:
+        raise ValueError(f"range too long (max {NEWS_MAX_WINDOWS * step} days per call); narrow start/end")
+    return windows
+
+
 @market_tool
-def get_company_news(symbol: str, days: int = 7, n: int = 8) -> dict[str, Any]:
-    """Finnhub company news for a US/CA ticker: last `days` (max 30), n items (max 20), ranked by relevance (company named in headline first; wire-service press releases and market-research spam demoted), with source, age_h and a short summary. Richer and longer-range than get_news_brief. Non-US tickers return no items; use get_news_brief or search_news for those."""
+def get_company_news(
+    symbol: str, days: int = 7, n: int = 8, start: str | None = None, end: str | None = None
+) -> dict[str, Any]:
+    """Finnhub company news for a US/CA ticker, ranked by relevance (company named in headline first; wire-service press releases and market-research spam demoted), with source, age_h and a short summary. Range: last `days` (no cap) or explicit start/end ISO dates (YYYY-MM-DD) for any past period; long ranges are fetched in 30-day windows and merged. Finnhub free plan only holds about 1 year; for older periods use search_news with start/end. n max 50. Non-US tickers return no items; use get_news_brief or search_news for those."""
 
     def fetch():
         key = _require_key("FINNHUB_API_KEY")
         name = symbol.upper().strip()
-        today = datetime.now(timezone.utc).date()
-        start = today - timedelta(days=max(1, min(days, 30)))
+        first, last = _news_range(days, start, end)
+        windows = _news_windows(first, last)
 
-        def load():
-            return _http_json(
-                FINNHUB_COMPANY_NEWS_URL,
-                {"symbol": name, "from": start.isoformat(), "to": today.isoformat(), "token": key},
-                allow_list=True,
+        def load(window):
+            lo, hi = window
+            return _aux_cached(
+                ("fh-news", name, lo, hi),
+                NEWS_CACHE_TTL if hi >= datetime.now(timezone.utc).date() else 86400,
+                lambda: _http_json(
+                    FINNHUB_COMPANY_NEWS_URL,
+                    {"symbol": name, "from": lo.isoformat(), "to": hi.isoformat(), "token": key},
+                    allow_list=True,
+                ),
             )
 
-        payload = _aux_cached(("fh-news", name, start), NEWS_CACHE_TTL, load)
+        if len(windows) == 1:
+            payloads = [load(windows[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                payloads = list(pool.map(load, windows))
+        payload = [row for chunk in payloads for row in chunk]
         rows = _finnhub_company_rows(payload, name, _company_keyword(name, key))
-        items = _news_items(rows, max(1, min(n, 20)), 200, ranked=True)
-        output: dict[str, Any] = {"symbol": name, "days": (today - start).days, "count": len(items), "items": items}
+        items = _news_items(rows, max(1, min(n, 50)), 200, ranked=True)
+        output: dict[str, Any] = {
+            "symbol": name,
+            "from": first.isoformat(),
+            "to": last.isoformat(),
+            "count": len(items),
+            "items": items,
+        }
         if not items:
-            output["note"] = "no Finnhub news; non-US tickers: use get_news_brief or search_news"
+            output["note"] = "no Finnhub news; non-US tickers or periods older than ~1 year: use search_news (start/end) or get_news_brief"
         return _result(output, delayed=False)
 
     return _safe_call(symbol, fetch)
@@ -1843,6 +1897,40 @@ def _newsapi_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
+NEWSAPI_FREE_DAYS = 30
+
+
+def _gnews_rows(query: str, lo: date, hi: date, language: str) -> list[dict[str, Any]]:
+    """Google News RSS for one date window (about 100 items max); any past period, no key."""
+
+    def load():
+        lang = language.lower()[:2] or "en"
+        country = "US" if lang == "en" else lang.upper()
+        params = {
+            "q": f"{query} after:{lo.isoformat()} before:{(hi + timedelta(days=1)).isoformat()}",
+            "hl": lang,
+            "gl": country,
+            "ceid": f"{country}:{lang}",
+        }
+        root = ET.fromstring(_http_text(f"{GOOGLE_NEWS_RSS_URL}?{urlencode(params)}", {"User-Agent": "Mozilla/5.0"}))
+        rows = []
+        for item in root.iter("item"):
+            stamp = None
+            try:
+                stamp = email.utils.parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                pass
+            title = html.unescape(item.findtext("title") or "")
+            publisher = item.findtext("source")
+            if publisher and title.endswith(f" - {publisher}"):
+                title = title[: -len(publisher) - 3]
+            rows.append({"headline": title, "source": publisher, "summary": "", "ts": stamp})
+        return rows
+
+    return _aux_cached(("gnews", query, lo, hi, language), NEWS_CACHE_TTL if hi >= datetime.now(timezone.utc).date() else 86400, load)
+
+
 @market_tool
 def search_news(
     query: str,
@@ -1851,39 +1939,67 @@ def search_news(
     n: int = 8,
     domains: str | None = None,
     language: str = "en",
+    start: str | None = None,
+    end: str | None = None,
 ) -> dict[str, Any]:
-    """NewsAPI keyword search across thousands of publishers: companies, products, people, themes, events ("Nvidia export ban", "OPEC cut", "bank run"). Boolean operators and quotes work in query (AND, OR, NOT, "exact phrase"). days max 30; sort relevancy (default, on-topic) | publishedAt (newest, can drift off-topic) | popularity; matches title/description only; n max 20; domains comma list e.g. "reuters.com,bloomberg.com". Free plan: articles are 24 h delayed and quota is 100 calls/day (cached 10 min), so prefer get_company_news / get_market_news for fresh ticker news."""
+    """Keyword news search for companies, products, people, themes, events ("Nvidia export ban", "OPEC cut", "bank run"). Boolean operators and quotes work in query (AND, OR, NOT, "exact phrase"). Range: last `days` (no cap) or explicit start/end ISO dates (YYYY-MM-DD), so any past period works (for example start=2020-03-01 end=2020-03-31 for the Covid crash). Ranges within 30 days use NewsAPI (sort relevancy | publishedAt | popularity; title/description match; domains comma list e.g. "reuters.com"; free plan 24 h delayed, 100 calls/day, cached 10 min); older or longer ranges use Google News archive search in 30-day windows (headline and publisher only, newest first, about 100 per window; sort and domains ignored, use "site:reuters.com" inside query instead). n max 50. Prefer get_company_news / get_market_news for fresh ticker news."""
 
     def fetch():
         if sort not in ("publishedAt", "relevancy", "popularity"):
             raise ValueError("sort must be publishedAt, relevancy or popularity")
-        _require_key("NEWSAPI_API_KEY")
-        start = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))).date().isoformat()
-        params = {
-            "q": query,
-            "from": start,
-            "sortBy": sort,
-            "language": language,
-            "pageSize": 30,
-            "searchIn": "title,description",
-        }
-        if domains:
-            params["domains"] = domains
-        payload = _aux_cached(
-            ("newsapi-search", tuple(sorted(params.items()))),
-            NEWS_CACHE_TTL,
-            lambda: _newsapi_get(NEWSAPI_EVERYTHING_URL, params),
-        )
-        items = _news_items(_newsapi_rows(payload), max(1, min(n, 20)), 200)
+        first, last = _news_range(days, start, end)
+        limit = max(1, min(n, 50))
+        today = datetime.now(timezone.utc).date()
+        recent = (today - first).days <= NEWSAPI_FREE_DAYS
+        if recent and os.environ.get("NEWSAPI_API_KEY"):
+            params = {
+                "q": query,
+                "from": first.isoformat(),
+                "to": last.isoformat(),
+                "sortBy": sort,
+                "language": language,
+                "pageSize": 30,
+                "searchIn": "title,description",
+            }
+            if domains:
+                params["domains"] = domains
+            payload = _aux_cached(
+                ("newsapi-search", tuple(sorted(params.items()))),
+                NEWS_CACHE_TTL,
+                lambda: _newsapi_get(NEWSAPI_EVERYTHING_URL, params),
+            )
+            items = _news_items(_newsapi_rows(payload), limit, 200)
+            return _result(
+                {
+                    "query": query,
+                    "source": "newsapi",
+                    "total": payload.get("totalResults"),
+                    "count": len(items),
+                    "items": items,
+                    "newsapi_calls_today": f"{_newsapi_used_today()}/{NEWSAPI_DAILY_QUOTA} (this server only)",
+                },
+                delayed=True,
+            )
+        windows = _news_windows(first, last)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            chunks = list(pool.map(lambda window: _gnews_rows(query, window[0], window[1], language), windows))
+        rows = [row for chunk in chunks for row in chunk]
+        # long ranges: spread items across the period instead of only the newest window
+        rows.sort(key=lambda item: _age_hours_exact(item["ts"]))
+        if len(windows) > 1 and len(rows) > limit:
+            step = len(rows) / limit
+            rows = [rows[int(i * step)] for i in range(limit)]
+        items = _news_items(rows, limit, 0)
         return _result(
             {
                 "query": query,
-                "total": payload.get("totalResults"),
+                "source": "google-news",
+                "from": first.isoformat(),
+                "to": last.isoformat(),
                 "count": len(items),
                 "items": items,
-                "newsapi_calls_today": f"{_newsapi_used_today()}/{NEWSAPI_DAILY_QUOTA} (this server only)",
             },
-            delayed=True,
+            delayed=False,
         )
 
     return _safe_call(query, fetch)

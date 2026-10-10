@@ -2,7 +2,7 @@
 
 > Instruction for Claude: read this whole file first. Then read every file under "Must read before any change". Do not modify anything until you have fully understood the project. Keep this file updated as you work (see "Maintenance rules").
 
-Last updated: 2026-10-07
+Last updated: 2026-10-10
 
 ## 1. What this project is
 Read-only market-data MCP server (Python 3.12, FastMCP 4). Exposes trading/analysis tools over Streamable HTTP at `/mcp`. Backed by yfinance, with live quote providers (CoinGecko, Finnhub, Alpaca websocket) and yfinance fallback. Hosted on Prefect Horizon (free, deploys from GitHub `main`, entrypoint `main.py:mcp`, OAuth enforced); previously Replit/Cloud Run (`.replit`, still works via `python main.py`). Consumed by Claude (the `mbs-agent`/`trading-agent` skills use it as the "yfinance-market-data" MCP server). No account/broker access.
@@ -110,6 +110,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 - 2026-10-07 - company news relevance scoring (`_finnhub_company_rows`): headline mention +3, summary +1, multi-ticker and wire-service penalties, market-research spam -3; `get_news_brief` uses ranked Finnhub for US tickers, yfinance for non-US/fallback.
 
 - 2026-10-07 - agent-review round: `_market_state` from exchange clock/calendar (NYSE holidays, pre/post, Xetra/LSE hours; Finnhub no longer hardcodes open); `compare` returns `window`; errors carry `retryable`; stale-while-error cache (6 h, `_cache_stale`); news near-duplicate dedupe; NewsAPI call counter; `position_size` `reason`; `get_events` `window`; new `self_test` tool. Correlations verified correct against independent pandas calc (not a bug). Declined: `fetched_at`/`cache_age_s` on every response (touches all tools, low value).
+
+- 2026-10-10 - historic news: `get_company_news` and `search_news` take `start`/`end` ISO dates, `days` has no cap. Finnhub fetched in 30-day windows (4 threads, merged; free plan holds about 1 year). `search_news` uses NewsAPI for ranges within 30 days when keyed, otherwise Google News RSS archive search (`after:`/`before:` windows, no key, headline and publisher only, about 100 per window). Items older than 7 days carry `date`. Max 240 windows per call.
 
 ## 8. Resume prompt
 Paste this into a new session:
