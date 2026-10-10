@@ -113,6 +113,8 @@ Deka ETFs and ETCs work through yfinance (`.DE`, `.L`; ISIN via `yf.Search`). Ac
 
 - 2026-10-10 - historic news: `get_company_news` and `search_news` take `start`/`end` ISO dates, `days` has no cap. Finnhub fetched in 30-day windows (4 threads, merged; free plan holds about 1 year). `search_news` uses NewsAPI for ranges within 30 days when keyed, otherwise Google News RSS archive search (`after:`/`before:` windows, no key, headline and publisher only, about 100 per window). Items older than 7 days carry `date`. Max 240 windows per call.
 
+- 2026-10-10 - `get_feed_news` gained `seekingalpha_currents`, `seekingalpha_articles` (market feeds) and per-ticker `yahoo_finance`, `seekingalpha_symbol` (new `symbol` arg, `SYMBOL_FEEDS`). Fed/ECB feeds already existed. All verified live, no key needed.
+
 ## 8. Resume prompt
 Paste this into a new session:
 > Read project-resume.md in this project fully. Read every file it lists under "Must read before any change". Then continue from "Current state". Do not change anything before you have understood the project. Keep project-resume.md updated.

@@ -19,7 +19,7 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from zoneinfo import ZoneInfo
 
@@ -2502,6 +2502,13 @@ RSS_FEEDS = {
     "handelsblatt_finanzen": "https://www.handelsblatt.com/contentexport/feed/finanzen",
     "marketwatch_top": "https://feeds.marketwatch.com/marketwatch/topstories/",
     "cnbc_business": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
+    "seekingalpha_currents": "https://seekingalpha.com/market_currents.xml",
+    "seekingalpha_articles": "https://seekingalpha.com/feed.xml",
+}
+# per-ticker feeds: URL template needs `symbol`
+SYMBOL_FEEDS = {
+    "yahoo_finance": "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US",
+    "seekingalpha_symbol": "https://seekingalpha.com/api/sa/combined/{symbol}.xml",
 }
 CENTRAL_BANK_FEEDS = {
     ("fed", "press"): "fed_press",
@@ -2511,9 +2518,16 @@ CENTRAL_BANK_FEEDS = {
 }
 
 
-def _rss_rows(feed: str) -> list[dict[str, Any]]:
+def _rss_rows(feed: str, symbol: str | None = None) -> list[dict[str, Any]]:
+    if feed in SYMBOL_FEEDS:
+        if not symbol:
+            raise ValueError(f"feed {feed} needs symbol")
+        url = SYMBOL_FEEDS[feed].format(symbol=quote(ticker_name(symbol), safe=""))
+    else:
+        url = RSS_FEEDS[feed]
+
     def load():
-        root = ET.fromstring(_http_text(RSS_FEEDS[feed], {"User-Agent": "Market-Data-MCP admin@example.com"}))
+        root = ET.fromstring(_http_text(url, {"User-Agent": "Market-Data-MCP admin@example.com"}))
         rows = []
         for item in root.iter("item"):
             stamp = None
@@ -2532,11 +2546,13 @@ def _rss_rows(feed: str) -> list[dict[str, Any]]:
             )
         return rows
 
-    return _aux_cached(("rss", feed), NEWS_CACHE_TTL, load)
+    return _aux_cached(("rss", feed, symbol), NEWS_CACHE_TTL, load)
 
 
-def _feed_items(feed: str, n: int, query: str | None, summary_chars: int) -> list[dict[str, Any]]:
-    rows = _rss_rows(feed)
+def _feed_items(
+    feed: str, n: int, query: str | None, summary_chars: int, symbol: str | None = None
+) -> list[dict[str, Any]]:
+    rows = _rss_rows(feed, symbol)
     if query:
         needle = query.lower()
         rows = [row for row in rows if needle in f"{row['headline']} {row['summary']}".lower()]
@@ -2561,16 +2577,21 @@ def get_central_bank_news(bank: str = "fed", kind: str = "press", n: int = 5) ->
 
 
 @market_tool
-def get_feed_news(feed: str = "handelsblatt_finanzen", n: int = 10, query: str | None = None) -> dict[str, Any]:
-    """Free no-key RSS market news. feed: handelsblatt_finanzen (DE, DAX/markets), tagesschau_wirtschaft (DE economy), marketwatch_top (US markets), cnbc_business (US business), plus central-bank feeds fed_press, fed_monetary, fed_speeches, ecb_press. Optional query keeps items whose headline or summary contains it (case-insensitive, e.g. "DAX", "Zinsen"). n max 25. German feeds return German text; use for DAX/European names where Finnhub and NewsAPI are thin."""
+def get_feed_news(
+    feed: str = "handelsblatt_finanzen", n: int = 10, query: str | None = None, symbol: str | None = None
+) -> dict[str, Any]:
+    """Free no-key RSS market news. Market feeds: handelsblatt_finanzen (DE, DAX/markets), tagesschau_wirtschaft (DE economy), marketwatch_top (US markets), cnbc_business (US business), seekingalpha_currents (US breaking market news), seekingalpha_articles (SA analysis articles), plus central-bank feeds fed_press, fed_monetary, fed_speeches, ecb_press. Per-ticker feeds (need symbol): yahoo_finance (any Yahoo ticker incl. non-US like SAP.DE, comma list ok), seekingalpha_symbol (US tickers, news and analysis). Optional query keeps items whose headline or summary contains it (case-insensitive, e.g. "DAX", "Zinsen"). n max 25. Latest items only, no archive (use search_news start/end for history). German feeds return German text; use for DAX/European names where Finnhub and NewsAPI are thin."""
 
     def fetch():
-        if feed not in RSS_FEEDS:
-            raise ValueError(f"feed must be one of {', '.join(RSS_FEEDS)}")
-        items = _feed_items(feed, n, query, 200)
-        return _result({"feed": feed, "count": len(items), "items": items}, delayed=False)
+        if feed not in RSS_FEEDS and feed not in SYMBOL_FEEDS:
+            raise ValueError(f"feed must be one of {', '.join([*RSS_FEEDS, *SYMBOL_FEEDS])}")
+        items = _feed_items(feed, n, query, 200, symbol)
+        output: dict[str, Any] = {"feed": feed, "count": len(items), "items": items}
+        if symbol:
+            output["symbol"] = symbol
+        return _result(output, delayed=False)
 
-    return _safe_call(feed, fetch)
+    return _safe_call(symbol or feed, fetch)
 
 
 @market_tool
